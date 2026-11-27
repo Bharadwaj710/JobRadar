@@ -121,6 +121,8 @@ def test_company_and_role_cleanup() -> None:
         ("Educational Qualification : 15 years full time education", (None, None)),
         ("A company with 25 years of history, great experience", (None, None)),
         ("Freshers welcome", (None, None)),
+        ("3+ years of professional experience preferred", (None, None)),
+        ("Preferred qualifications: 5+ years experience", (None, None)),
     ],
 )  # fmt: skip
 def test_experience_in_description(text: str, years: tuple[float | None, float | None]) -> None:

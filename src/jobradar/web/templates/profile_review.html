@@ -1,0 +1,248 @@
+{% extends "base.html" %}
+{% block title %}Review Profile: JobRadar{% endblock %}
+{% block main %}
+<div class="review-container" style="max-width: 840px; margin: 0 auto; padding: 24px 16px;">
+  <div class="page-head" style="margin-bottom: 20px; display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 12px;">
+    <div>
+      <h1 style="font-size: 28px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 6px;">Review & Confirm Candidate Profile</h1>
+      <p style="color: var(--muted); margin: 0; font-size: 14.5px;">
+        Verify and adjust extracted information before finalizing your profile.
+      </p>
+    </div>
+    <div style="display: flex; align-items: center; gap: 8px;">
+      <span class="badge {% if profile.status == 'confirmed' %}hot{% endif %}" style="text-transform: uppercase; font-weight: 700;">
+        {{ profile.status }} (v{{ profile.version }})
+      </span>
+      {% set metadata = profile.profile_data.get('evidence', {}).get('metadata', {}) %}
+      {% if metadata.get('confidence') %}
+      <span class="badge" title="Extraction confidence" style="font-weight: 600;">
+        {{ (metadata.get('confidence', 0) * 100) | round | int }}% Confidence
+      </span>
+      {% endif %}
+    </div>
+  </div>
+
+  {# Visual Stepper #}
+  <div class="stepper-container" style="margin-bottom: 28px;">
+    <div class="stepper-step done">
+      <div class="step-num">✓</div>
+      <span>1. Upload Resume</span>
+    </div>
+    <div class="stepper-step active">
+      <div class="step-num">2</div>
+      <span>2. Review Profile</span>
+    </div>
+    <div class="stepper-step {% if confirmed %}done{% endif %}">
+      <div class="step-num">{% if confirmed %}✓{% else %}3{% endif %}</div>
+      <span>3. Match Radar</span>
+    </div>
+  </div>
+
+  {% if confirmed %}
+  <div class="notice card-saas" style="background: var(--good-soft); color: var(--good); border: 1px solid var(--good); margin-bottom: 20px; padding: 16px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;">
+    <div>
+      <strong>Profile Confirmed!</strong> Your candidate profile is now active (Version {{ profile.version }}).
+    </div>
+    <a href="/candidate/dashboard" class="btn-primary-saas" style="text-decoration: none; font-size: 13.5px; padding: 8px 18px;">
+      View Personalized Match Radar &rarr;
+    </a>
+  </div>
+  {% endif %}
+
+  {% set warnings = metadata.get('warnings', []) %}
+  {% if warnings %}
+  <div class="notice card-saas" style="background: var(--fair-soft); color: var(--fair); border: 1px solid var(--fair); margin-bottom: 20px; padding: 14px 18px;">
+    <strong>Extraction Notices:</strong>
+    <ul style="margin: 6px 0 0; padding-left: 20px; line-height: 1.5;">
+      {% for w in warnings %}
+      <li>{{ w }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <form action="/onboarding/confirm/{{ profile.id }}" method="post" style="display: grid; gap: 24px;">
+    <input type="hidden" name="token" value="{{ csrf_token }}">
+
+    {# Section 1: Basics #}
+    {% set basics = profile.profile_data.get('basics', {}) %}
+    <div class="card-saas" style="padding: 24px;">
+      <h2 style="font-size: 17px; font-weight: 750; margin: 0 0 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px;">
+        1. Personal Details
+      </h2>
+      <div class="form-grid-2col">
+        <div class="form-group">
+          <label for="f-name" class="form-label">Full Name <span class="required">*</span></label>
+          <input id="f-name" type="text" name="name" value="{{ basics.get('name', '') }}" required>
+        </div>
+        <div class="form-group">
+          <label for="f-email" class="form-label">Email Address <span class="required">*</span></label>
+          <input id="f-email" type="email" name="email" value="{{ basics.get('email', '') }}" required>
+        </div>
+        <div class="form-group">
+          <label for="f-phone" class="form-label">Phone</label>
+          <input id="f-phone" type="text" name="phone" value="{{ basics.get('phone', '') }}">
+        </div>
+        <div class="form-group">
+          <label for="f-location" class="form-label">Location</label>
+          <input id="f-location" type="text" name="location" value="{{ basics.get('location', '') }}" placeholder="e.g. Bengaluru, India">
+        </div>
+        <div class="form-group">
+          <label for="f-github" class="form-label">GitHub Profile URL</label>
+          <input id="f-github" type="text" name="github" value="{{ basics.get('github', '') }}" placeholder="https://github.com/username">
+        </div>
+        <div class="form-group">
+          <label for="f-linkedin" class="form-label">LinkedIn Profile URL</label>
+          <input id="f-linkedin" type="text" name="linkedin" value="{{ basics.get('linkedin', '') }}" placeholder="https://linkedin.com/in/username">
+        </div>
+      </div>
+    </div>
+
+    {# Section 2: Education #}
+    {% set edus = profile.profile_data.get('education', []) %}
+    {% set edu0 = edus[0] if edus else {} %}
+    <div class="card-saas" style="padding: 24px;">
+      <h2 style="font-size: 17px; font-weight: 750; margin: 0 0 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px;">
+        2. Primary Education
+      </h2>
+      <div class="form-grid-2col">
+        <div class="form-group">
+          <label for="f-degree" class="form-label">Degree</label>
+          <input id="f-degree" type="text" name="degree" value="{{ edu0.get('degree', '') }}" placeholder="e.g. B.Tech / B.E.">
+        </div>
+        <div class="form-group">
+          <label for="f-branch" class="form-label">Branch / Major</label>
+          <input id="f-branch" type="text" name="branch" value="{{ edu0.get('branch', '') }}" placeholder="e.g. Computer Science / Electrical">
+        </div>
+        <div class="form-group form-col-full">
+          <label for="f-institution" class="form-label">Institution / University</label>
+          <input id="f-institution" type="text" name="institution" value="{{ edu0.get('institution', '') }}" placeholder="e.g. National Institute of Technology">
+        </div>
+        <div class="form-group">
+          <label for="f-grad-year" class="form-label">Graduation Year</label>
+          <input id="f-grad-year" type="number" name="graduation_year" value="{{ edu0.get('graduation_year', '') }}" placeholder="e.g. 2026" min="2000" max="2035">
+        </div>
+        <div class="form-group">
+          <label for="f-cgpa" class="form-label">CGPA / Percentage</label>
+          <input id="f-cgpa" type="text" name="cgpa" value="{{ edu0.get('cgpa', '') }}" placeholder="e.g. 8.4/10 or 82%">
+        </div>
+      </div>
+    </div>
+
+    {# Section 3: Technical Skills #}
+    {% set skills = profile.profile_data.get('skills', []) %}
+    <div class="card-saas" style="padding: 24px;">
+      <h2 style="font-size: 17px; font-weight: 750; margin: 0 0 8px; border-bottom: 1px solid var(--line); padding-bottom: 10px;">
+        3. Technical Skills
+      </h2>
+      <p style="font-size: 13px; color: var(--muted); margin: 0 0 14px;">
+        Comma-separated list of programming languages, frameworks, and tools.
+      </p>
+      <div class="form-group">
+        <textarea id="f-skills" name="skills" rows="3">{{ skills | join(', ') }}</textarea>
+      </div>
+      {% if skills %}
+      <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px;">
+        {% for s in skills %}
+        <span class="badge" style="background: var(--accent-soft); color: var(--accent); font-weight: 600; padding: 4px 10px;">{{ s }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    {# Section 4: Experience & Internships #}
+    {% set experiences = profile.profile_data.get('experience', []) %}
+    <div class="card-saas" style="padding: 24px;">
+      <h2 style="font-size: 17px; font-weight: 750; margin: 0 0 12px; border-bottom: 1px solid var(--line); padding-bottom: 10px;">
+        4. Experience & Internships
+      </h2>
+      {% if experiences %}
+      <div style="display: grid; gap: 14px;">
+        {% for exp in experiences %}
+        <div class="card-nested">
+          <div class="card-nested-title">
+            <span>{{ exp.get('title') or 'Role' }} &bull; {{ exp.get('company') or 'Company' }}</span>
+            {% if exp.get('dates') %}<span class="card-nested-dates">{{ exp.get('dates') }}</span>{% endif %}
+          </div>
+          {% if exp.get('bullets') %}
+          <ul class="card-nested-list">
+            {% for b in exp.get('bullets') %}
+            <li>{{ b.text if b is mapping else b }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p style="font-size: 13.5px; color: var(--muted); margin: 0;">
+        No prior formal experience detected. (Typical for freshers; your projects and education will drive recommendations.)
+      </p>
+      {% endif %}
+    </div>
+
+    {# Section 5: Projects #}
+    {% set projects = profile.profile_data.get('projects', []) %}
+    <div class="card-saas" style="padding: 24px;">
+      <h2 style="font-size: 17px; font-weight: 750; margin: 0 0 12px; border-bottom: 1px solid var(--line); padding-bottom: 10px;">
+        5. Projects
+      </h2>
+      {% if projects %}
+      <div style="display: grid; gap: 14px;">
+        {% for proj in projects %}
+        <div class="card-nested">
+          <div class="card-nested-title">
+            <span>{{ proj.get('name') or 'Project' }}</span>
+          </div>
+          {% if proj.get('tools') %}
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0;">
+            {% for t in proj.get('tools') %}
+            <span class="badge" style="font-size: 11.5px; padding: 2px 8px;">{{ t }}</span>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if proj.get('bullets') %}
+          <ul class="card-nested-list">
+            {% for b in proj.get('bullets') %}
+            <li>{{ b.text if b is mapping else b }}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p style="font-size: 13.5px; color: var(--muted); margin: 0;">No projects detected.</p>
+      {% endif %}
+    </div>
+
+    {# Section 6: Evidence & Citations #}
+    {% set snippets = profile.profile_data.get('evidence', {}).get('snippets', {}) %}
+    {% if snippets %}
+    <details class="card-saas" style="padding: 18px 24px;">
+      <summary style="font-size: 14.5px; font-weight: 700; cursor: pointer; color: var(--ink-secondary);">
+        View Original Resume Evidence Snippets (Transparency Audit)
+      </summary>
+      <div style="margin-top: 14px; display: grid; gap: 10px; font-size: 13px;">
+        {% for key, lines in snippets.items() %}
+        <div style="background: var(--raise); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line);">
+          <strong style="text-transform: capitalize; color: var(--accent);">{{ key }}:</strong>
+          <span style="color: var(--ink); margin-left: 6px;">{{ lines | join('; ') }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </details>
+    {% endif %}
+
+    {# Confirmation Bar #}
+    <div style="display: flex; align-items: center; justify-content: space-between; padding-top: 10px; flex-wrap: wrap; gap: 14px;">
+      <a href="/onboarding" class="btn-secondary-saas" style="text-decoration: none;">
+        &larr; Upload a different resume
+      </a>
+      <button type="submit" class="btn-primary-saas" style="font-size: 15px; font-weight: 700; padding: 10px 24px; cursor: pointer;">
+        Confirm Profile & Activate
+      </button>
+    </div>
+  </form>
+</div>
+{% endblock %}

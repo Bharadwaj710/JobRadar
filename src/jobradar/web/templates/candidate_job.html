@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% from "_macros.html" import ring with context %}
+{% block title %}{{ job_data.get('role', job.role or 'Job Details') }} · Candidate Fit · JobRadar{% endblock %}
+
+{% block main %}
+<div class="job-detail-head" style="margin-bottom: 24px;">
+  <p style="margin: 0 0 14px; font-size: 13.5px;">
+    <a href="/candidate/dashboard" class="btn-secondary-saas" style="text-decoration: none; display: inline-flex; align-items: center; gap: 6px;">
+      &larr; Back to Match Radar
+    </a>
+  </p>
+
+  <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
+    <div>
+      <h1 style="font-size: 28px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 8px;">
+        {{ job_data.get('role') or job.role or "Software Engineer" }}
+      </h1>
+      <p style="margin: 0; color: var(--muted); font-size: 15px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+        <strong style="color: var(--ink);">{{ job_data.get('company') or job.company or "Company" }}</strong> &bull;
+        <span>📍 {{ job_data.get('location') or "India / Remote" }}</span>
+        {% if job_data.get('apply_url') or job.canonical_url %}
+          &bull; <a href="{{ job_data.get('apply_url') or job.canonical_url }}" target="_blank" rel="noopener noreferrer" style="color: var(--accent); font-weight: 600;">Direct Apply Link ↗</a>
+        {% endif %}
+        &bull; <a href="/jobs/{{ job.id }}" style="color: var(--muted); text-decoration: none; font-size: 13.5px;">View Full Listing &rarr;</a>
+      </p>
+    </div>
+
+    {% if application %}
+    <span class="badge hot" style="font-size: 13px; text-transform: uppercase; padding: 6px 12px; font-weight: 700;">
+      Current Status: {{ application.status }}
+    </span>
+    {% endif %}
+  </div>
+</div>
+
+{# Application Tracker Form #}
+<div class="card-saas" style="padding: 20px 24px; margin-bottom: 28px;">
+  <h2 style="font-size: 16px; font-weight: 750; margin: 0 0 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; display: flex; align-items: center; gap: 8px;">
+    <svg class="i xs"><use href="#i-check"/></svg> Application Tracking
+  </h2>
+  <form method="post" action="/candidate/jobs/{{ job.id }}/status" style="display: grid; gap: 16px;">
+    <input type="hidden" name="token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="/candidate/jobs/{{ job.id }}">
+
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; align-items: end;">
+      <div class="form-group">
+        <label for="f-status" class="form-label">Application Status</label>
+        <select id="f-status" name="status">
+          {% set cur_status = application.status if application else 'saved' %}
+          <option value="saved" {% if cur_status == 'saved' %}selected{% endif %}>Saved (Considering)</option>
+          <option value="applied" {% if cur_status == 'applied' %}selected{% endif %}>Applied (Submitted)</option>
+          <option value="interviewing" {% if cur_status == 'interviewing' %}selected{% endif %}>Interviewing (In Progress)</option>
+          <option value="offered" {% if cur_status == 'offered' %}selected{% endif %}>Offered (Received Offer)</option>
+          <option value="rejected" {% if cur_status == 'rejected' %}selected{% endif %}>Rejected (Declined)</option>
+          <option value="skipped" {% if cur_status == 'skipped' %}selected{% endif %}>Skipped (Not Interested)</option>
+        </select>
+      </div>
+
+      <div class="form-group" style="flex: 2;">
+        <label for="f-notes" class="form-label">Candidate Notes / Interview Details</label>
+        <input id="f-notes" type="text" name="notes" value="{{ application.notes if application else '' }}" placeholder="e.g. Applied via referral; recruiter call next Tuesday">
+      </div>
+
+      <div>
+        <button type="submit" class="btn-primary-saas" style="width: 100%; height: 38px; font-weight: 700; cursor: pointer;">
+          Update Application
+        </button>
+      </div>
+    </div>
+  </form>
+</div>
+
+{# Four-Track Assessments with Interactive Switcher #}
+<div style="margin-bottom: 28px;">
+  <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 14px;">
+    <h2 style="font-size: 18px; font-weight: 800; margin: 0;">
+      Personalized Technical Fit by Career Track
+    </h2>
+    <span style="font-size: 13px; color: var(--muted);">Click any track to inspect deep technical match</span>
+  </div>
+
+  {% if not assessments %}
+  <div class="card-saas" style="padding: 24px; text-align: center;">
+    <p style="color: var(--muted); margin: 0;">No active track assessments generated for this job yet.</p>
+  </div>
+  {% else %}
+  {# Interactive Track Tab Bar #}
+  <div class="track-tab-bar" role="tablist" style="margin-bottom: 16px;">
+    {% for a in assessments %}
+    <button type="button" class="track-tab-btn {% if loop.first %}active{% endif %}" data-tab="tab-track-{{ a.track }}" role="tab" aria-selected="{{ 'true' if loop.first else 'false' }}">
+      <span class="track-pill track-{{ a.track }}" style="font-size: 11px;">{{ a.track | replace('_', ' ') }}</span>
+      <span style="font-weight: 700; font-size: 13.5px; margin-left: 4px;">{{ (a.technical_score ~ '%') if a.technical_score is not none else 'Unscored' }}</span>
+    </button>
+    {% endfor %}
+  </div>
+
+  {# Tab Panes #}
+  {% for a in assessments %}
+  <div id="tab-track-{{ a.track }}" class="track-tab-pane card-saas" {% if not loop.first %}hidden{% endif %} style="padding: 24px;">
+    <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 14px; margin-bottom: 16px; border-bottom: 1px solid var(--line); padding-bottom: 14px;">
+      <div>
+        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+          <h3 style="font-size: 18px; font-weight: 750; margin: 0; text-transform: uppercase;">
+            {{ a.track | replace('_', ' ') }}
+          </h3>
+          {% if a.eligibility_status == 'ELIGIBLE' %}
+            <span class="badge-eligibility badge-elig-eligible">ELIGIBLE</span>
+          {% elif a.eligibility_status == 'LIKELY_ELIGIBLE' %}
+            <span class="badge-eligibility badge-elig-likely">LIKELY ELIGIBLE</span>
+          {% elif a.eligibility_status == 'NEEDS_VERIFICATION' %}
+            <span class="badge-eligibility badge-elig-verify">NEEDS VERIFICATION</span>
+          {% else %}
+            <span class="badge-eligibility badge-elig-ineligible">NOT ELIGIBLE</span>
+          {% endif %}
+        </div>
+        <p style="margin: 0; font-size: 13.5px; color: var(--muted);">
+          Evidence Coverage: <strong style="color: var(--ink);">{{ (a.evidence_coverage * 100) | round | int }}%</strong>
+          {% if a.recommended_resume %}
+            &bull; Recommended Resume Variant: <code class="mono">{{ a.recommended_resume }}</code>
+          {% endif %}
+        </p>
+      </div>
+
+      <div style="display: flex; align-items: center; gap: 10px;">
+        {{ ring(a.technical_score) }}
+      </div>
+    </div>
+
+    {# Explanation #}
+    <p style="font-size: 14px; line-height: 1.6; margin: 0 0 16px; color: var(--ink);">
+      {{ a.explanation }}
+    </p>
+
+    {# Eligibility Blockers #}
+    {% if a.eligibility_reasons %}
+    <div style="background: var(--bad-soft); border: 1px solid var(--bad); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;">
+      <strong style="color: var(--bad); font-size: 13px;">Eligibility Requirements & Blockers:</strong>
+      <ul style="margin: 6px 0 0; padding-left: 18px; color: var(--bad); font-size: 13px;">
+        {% for r in a.eligibility_reasons %}
+          <li>{{ r }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    {# Skills Breakdown #}
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
+      <div style="background: var(--raise); border: 1px solid var(--line); border-radius: 10px; padding: 14px;">
+        <h4 style="font-size: 13px; font-weight: 700; color: var(--good); margin: 0 0 8px; display: flex; align-items: center; gap: 6px;">
+          ✓ Matched Evidence Skills ({{ a.matched_skills | length }})
+        </h4>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          {% for s in a.matched_skills %}
+            <span class="badge" style="background: var(--good-soft); color: var(--good); border: 1px solid var(--good); font-weight: 600;">{{ s }}</span>
+          {% else %}
+            <span style="font-size: 12.5px; color: var(--muted);">No matched skills detected.</span>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div style="background: var(--raise); border: 1px solid var(--line); border-radius: 10px; padding: 14px;">
+        <h4 style="font-size: 13px; font-weight: 700; color: var(--bad); margin: 0 0 8px; display: flex; align-items: center; gap: 6px;">
+          ✕ Missing Required Skills ({{ a.missing_required_skills | length }})
+        </h4>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px;">
+          {% for s in a.missing_required_skills %}
+            <span class="badge" style="background: var(--bad-soft); color: var(--bad); border: 1px solid var(--bad); font-weight: 600;">{{ s }}</span>
+          {% else %}
+            <span style="font-size: 12.5px; color: var(--good); font-weight: 600;">All required track skills covered!</span>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+
+{# Application Status Audit Trail #}
+{% if history %}
+<div class="card-saas" style="padding: 20px 24px;">
+  <h2 style="font-size: 16px; font-weight: 750; margin: 0 0 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; display: flex; align-items: center; gap: 8px;">
+    <svg class="i xs"><use href="#i-clock"/></svg> Application History Log
+  </h2>
+  <ul style="list-style: none; margin: 0; padding: 0; display: grid; gap: 10px;">
+    {% for h in history %}
+    <li style="display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; background: var(--raise); border: 1px solid var(--line); border-radius: 8px; font-size: 13px;">
+      <div>
+        <span class="badge" style="text-transform: capitalize; margin-right: 8px; font-weight: 700;">{{ h.status }}</span>
+        {% if h.notes %}<span style="color: var(--ink); font-weight: 500;">{{ h.notes }}</span>{% endif %}
+      </div>
+      <span style="color: var(--muted); font-size: 12px; font-family: var(--mono);">{{ h.changed_at }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% endblock %}

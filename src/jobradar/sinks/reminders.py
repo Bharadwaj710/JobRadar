@@ -21,6 +21,7 @@ from jobradar.db.repo import Repo, TaskRecord
 from jobradar.pipeline.liveness import Liveness, LivenessChecker
 from jobradar.pipeline.task_types import CLOSING_CHECK
 from jobradar.queue.tasks import TaskQueue
+from jobradar.sinks.candidate_context import resolve_sink_candidate
 from jobradar.sinks.email_actions import Actions
 from jobradar.sinks.email_notify import PREVIEW_DIR, notion_url, save_preview, smtp_send
 from jobradar.sinks.email_template import job_card, layout, posting_of
@@ -91,6 +92,7 @@ class ClosingReminder:
         repo: Repo,
         queue: TaskQueue,
         liveness: LivenessChecker | None = None,
+        candidate_id: str | None = None,
         clock: Clock = utcnow,
         preview_dir: Path = PREVIEW_DIR,
     ) -> None:
@@ -99,6 +101,7 @@ class ClosingReminder:
         self.repo = repo
         self.queue = queue
         self.liveness = liveness
+        self.candidate_id = candidate_id
         self.clock = clock
         self.preview_dir = preview_dir
 
@@ -118,20 +121,39 @@ class ClosingReminder:
         if local.hour not in WAKING_HOURS:
             return "night: reminders wait for the morning"
         today = local.date()
-        due = [
-            job
-            for job in self.repo.jobs_closing(
-                today.isoformat(), (today + timedelta(days=1)).isoformat()
-            )
-            if job.status in _SHORTLISTED and self.repo.get_setting(REMINDED + job.id) is None
-        ]
+        target_deadlines = (today.isoformat(), (today + timedelta(days=1)).isoformat())
+
+        cand, active_profile = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        if self.candidate_id and (cand is None or active_profile is None):
+            return "candidate profile not confirmed: reminders skipped"
+
+        if cand:
+            pairs = self.repo.list_candidate_applications_with_jobs(cand.id, statuses=["saved"])
+            due = [
+                job
+                for _, job in pairs
+                if job.deadline in target_deadlines
+                and self.repo.get_setting(f"closing_reminder:{cand.id}:{job.id}") is None
+                and self.repo.get_setting(REMINDED + job.id) is None
+            ]
+        else:
+            due = [
+                job
+                for job in self.repo.jobs_closing(
+                    today.isoformat(), (today + timedelta(days=1)).isoformat()
+                )
+                if job.status in _SHORTLISTED and self.repo.get_setting(REMINDED + job.id) is None
+            ]
         jobs = [job for job in due if not await self._closed(job)]
         if not jobs:
             return "nothing closing soon"
         secrets = self.settings.secrets
         sender = secrets.email_address or "jobradar@localhost"
+        actions = Actions.load(
+            self.settings, self.repo, candidate_id=cand.id if cand else None, clock=self.clock
+        )
         msg = build_reminder(jobs, today.isoformat(), sender, secrets.notify_address or sender,
-                             Actions.load(self.settings, self.repo),
+                             actions,
                              self.settings.config.notion.enabled)  # fmt: skip
         if self.notify.dry_run:
             path = save_preview(msg, self.preview_dir / f"reminder-{local:%Y%m%d-%H%M}.html")
@@ -144,6 +166,8 @@ class ClosingReminder:
             log.info("closing reminder sent", extra={"jobs": len(jobs)})
             outcome = f"sent: {msg['Subject']}"
         for job in jobs:
+            if cand:
+                self.repo.set_setting(f"closing_reminder:{cand.id}:{job.id}", to_iso(self.clock()))
             self.repo.set_setting(REMINDED + job.id, to_iso(self.clock()))
         return outcome
 

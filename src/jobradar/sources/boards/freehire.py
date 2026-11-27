@@ -72,15 +72,19 @@ def post_text(job: dict[str, Any]) -> str:
     return "\n".join(line for line in lines if line and line != "Company")
 
 
-def why_not(job: dict[str, Any]) -> str | None:
+def why_not(job: dict[str, Any], *, candidate_independent: bool = False) -> str | None:
     """Why a freehire posting isn't worth a look; None when it is."""
     if job.get("closed_at"):
         return "closed"
-    if job.get("is_tech") == "non_tech":
-        return "not a tech role"
     if (job.get("reality") or {}).get("fake_freshness"):
         return "an old posting made to look new"
-    return why_skipped(str(job.get("title") or ""), str(job.get("location") or ""))
+    if not candidate_independent and job.get("is_tech") == "non_tech":
+        return "not a tech role"
+    return why_skipped(
+        str(job.get("title") or ""),
+        str(job.get("location") or ""),
+        candidate_independent=candidate_independent,
+    )
 
 
 class FreehireWatcher:
@@ -180,9 +184,10 @@ class FreehireWatcher:
             log.info("freehire baseline: existing postings recorded, no alerts",
                      extra={"postings": len(current)})  # fmt: skip
         else:
+            cand_ind = getattr(self.config, "candidate_independent", False)
             fresh = [j for j in jobs if self._id(j) not in seen]
             for job in fresh:
-                why = why_not(job)
+                why = why_not(job, candidate_independent=cand_ind)
                 about = {"title": str(job.get("title"))[:80],
                          "company": str(job.get("company"))[:40],
                          "where": str(job.get("location"))[:60]}  # fmt: skip
@@ -192,7 +197,7 @@ class FreehireWatcher:
                 else:
                     log.info("freehire posting skipped", extra=about | {"why": why})
             if fresh:
-                board.latest_json = self._latest(fresh[0], now)
+                board.latest_json = self._latest(fresh[0], now, candidate_independent=cand_ind)
             if len(passed) > MAX_NEW:
                 log.warning("freehire passed on too many at once; keeping the newest 20",
                             extra={"new": len(passed)})  # fmt: skip
@@ -226,8 +231,8 @@ class FreehireWatcher:
         )
 
     @staticmethod
-    def _latest(job: dict[str, Any], now: datetime) -> str:
-        why = why_not(job)
+    def _latest(job: dict[str, Any], now: datetime, *, candidate_independent: bool = False) -> str:
+        why = why_not(job, candidate_independent=candidate_independent)
         return json.dumps({
             "title": str(job.get("title") or ""), "where": str(job.get("location") or ""),
             "verdict": "passed" if why is None else why, "seen": to_iso(now),

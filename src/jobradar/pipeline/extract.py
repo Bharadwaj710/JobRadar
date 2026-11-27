@@ -20,10 +20,11 @@ from jobradar.db.models import FetchedPage, JobStatus
 from jobradar.db.repo import Repo, Sighting, TaskRecord
 from jobradar.llm import SchemaError, load_prompt
 from jobradar.pipeline.dedupe import role_key
-from jobradar.pipeline.fetch import Fetcher
+from jobradar.pipeline.fetch import Fetcher, Page, needs_greenhouse_detail
 from jobradar.pipeline.post_labels import from_post
+from jobradar.pipeline.requirements import analyze_requirements
 from jobradar.pipeline.schemas import JobPosting
-from jobradar.pipeline.structured import from_job_posting
+from jobradar.pipeline.structured import description_text, from_job_posting
 from jobradar.pipeline.task_types import EXTRACT, MATCH, NOTION_BODY, NOTION_UPSERT, priority
 from jobradar.queue.tasks import MAX_ATTEMPTS, RetryableError, TaskQueue
 
@@ -34,15 +35,45 @@ log = logging.getLogger(__name__)
 
 
 PAGE_TEXT_LIMIT = 12_000
-RULES_VERSION = "rules-v1"  # bump when structured.py / post_labels.py change meaning
+RULES_VERSION = "rules-v3"  # bump when deterministic extraction rules change meaning
 _SKIP = (JobStatus.HIDDEN, JobStatus.DISCARDED)
 _NOT_LIVE = (JobStatus.HIDDEN.value, JobStatus.DISCARDED.value)
 _KEY = ("role", "company")
+_DETERMINISTIC_FIELDS = {"requirements", "role_tracks"}
 PAGE_DEADLINE_DAYS = 45  # page deadlines further out than this are usually boilerplate
 SAME_ROLE_DAYS = 30  # a role seen again within this many days is the same opening
 SAME_ROLE = "same role as an earlier job"
 
 ExtractMode = Literal["fallback", "always"]
+
+
+def _merge_requirement_fields(
+    fields: dict[str, Any],
+    sources: dict[str, str],
+    role: str | None,
+    page_text: str | None,
+    post_text: str | None,
+) -> None:
+    """Merge deterministic fields without replacing stronger structured or label values."""
+    found = analyze_requirements(role, page_text, post_text)
+    for name in _DETERMINISTIC_FIELDS:
+        if value := found.get(name):
+            fields[name] = value
+            sources[name] = "requirements_rules"
+    for name in ("skills_required", "skills_preferred"):
+        additions = list(found.get(name) or [])
+        if not additions:
+            continue
+        current = list(fields.get(name) or [])
+        combined = list(dict.fromkeys([*current, *additions]))
+        if combined != current:
+            fields[name] = combined
+            previous = sources.get(name)
+            sources[name] = f"{previous}+requirements_rules" if previous else "requirements_rules"
+    for name in ("experience_min", "experience_max"):
+        if name not in fields and name in found:
+            fields[name] = found[name]
+            sources[name] = "requirements_rules"
 
 
 def free_fields(
@@ -135,6 +166,30 @@ def own_post(repo: Repo, job_id: str) -> str | None:
     return None
 
 
+def greenhouse_ref(sightings: list[Sighting]) -> tuple[str, str] | None:
+    """The board and posting ID for a job seen directly on Greenhouse, if any."""
+    for sighting in sightings:
+        if sighting.platform == "board" and sighting.chat_id.startswith("greenhouse:"):
+            return sighting.chat_id.removeprefix("greenhouse:"), sighting.message_id
+    return None
+
+
+async def _complete_greenhouse_page(
+    fetcher: Fetcher,
+    page: Page,
+    reference: tuple[str, str] | None,
+    original_url: str,
+) -> Page:
+    """Prefer a longer official description when the employer page is unusable or truncated."""
+    if reference is None or not needs_greenhouse_detail(page):
+        return page
+    board, posting_id = reference
+    detail = await fetcher.fetch_greenhouse_detail(board, posting_id, original_url)
+    if detail.text and len(detail.text) > len(page.text or ""):
+        return detail
+    return page
+
+
 class Extractor:
     def __init__(
         self,
@@ -164,6 +219,12 @@ class Extractor:
         if job.canonical_url:
             try:
                 page = await self.fetcher.fetch(job.canonical_url)
+                page = await _complete_greenhouse_page(
+                    self.fetcher,
+                    page,
+                    greenhouse_ref(self.repo.job_sightings(job.id)),
+                    job.canonical_url,
+                )
             except RetryableError as e:
                 if task.attempts < MAX_ATTEMPTS - 2:
                     raise
@@ -189,7 +250,13 @@ class Extractor:
 
         structured = json.loads(page.structured_json) if page and page.structured_json else None
         from_board = any(s.platform == "board" for s in sightings)
-        fields, sources = free_fields(structured, own_post(self.repo, job.id), posted, from_board)
+        post_text = own_post(self.repo, job.id)
+        fields, sources = free_fields(structured, post_text, posted, from_board)
+        page_text = (page.text if page else None) or (
+            description_text(structured) if structured else None
+        )
+        role = fields.get("role") or (page.title if page else None)
+        _merge_requirement_fields(fields, sources, role, page_text, post_text)
         if published := published_on(fields.get("published_on"), sightings, self.clock().date()):
             fields["published_on"] = published
             sources["published_on"] = sources.get("published_on", "board")
@@ -209,8 +276,8 @@ class Extractor:
             else:
                 for name in JobPosting.model_fields:
                     value = getattr(found, name)
-                    if name == "published_on":
-                        continue  # only the site's own date counts; the LLM would guess
+                    if name == "published_on" or name in _DETERMINISTIC_FIELDS:
+                        continue  # dates and evidence-backed requirements never come from the LLM
                     if name not in fields and value not in (None, "", [], "unknown"):
                         fields[name], sources[name] = value, "llm"
                 is_job = found.is_job
@@ -221,6 +288,8 @@ class Extractor:
             self.repo.set_job_status(job.id, JobStatus.NEEDS_REVIEW, reason)
             return
 
+        role = fields.get("role") or (page.title if page else None)
+        _merge_requirement_fields(fields, sources, role, page_text, post_text)
         fields.setdefault("confidence", 0.9 if has_key_fields else 0.5)
         posting = JobPosting.model_validate(fields)
         used_llm = "llm" in sources.values()  # includes its confidence

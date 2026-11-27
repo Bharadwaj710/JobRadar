@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Candidate Onboarding: JobRadar{% endblock %}
+{% block main %}
+<div class="onboarding-container" style="max-width: 780px; margin: 0 auto; padding: 24px 16px;">
+  <div class="page-head" style="margin-bottom: 24px;">
+    <h1 style="font-size: 28px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 8px;">Candidate Profile Onboarding</h1>
+    <p style="color: var(--muted); margin: 0; font-size: 15px;">
+      Upload your resume to automatically extract your education, skills, and experience into a candidate profile.
+    </p>
+  </div>
+
+  {# Visual Stepper #}
+  <div class="stepper-container" style="margin-bottom: 28px;">
+    <div class="stepper-step active">
+      <div class="step-num">1</div>
+      <span>1. Upload Resume</span>
+    </div>
+    <div class="stepper-step">
+      <div class="step-num">2</div>
+      <span>2. Review Profile</span>
+    </div>
+    <div class="stepper-step">
+      <div class="step-num">3</div>
+      <span>3. Match Radar</span>
+    </div>
+  </div>
+
+  {% if error %}
+  <div class="notice card-saas" style="background: var(--bad-soft); color: var(--bad); border: 1px solid var(--bad); margin-bottom: 20px; padding: 14px 18px;">
+    <strong>Upload Error:</strong> {{ error }}
+  </div>
+  {% endif %}
+
+  {% if confirmed %}
+  <div class="notice card-saas" style="background: var(--good-soft); color: var(--good); border: 1px solid var(--good); margin-bottom: 20px; padding: 14px 18px;">
+    <strong>Profile Confirmed!</strong> Your candidate profile is active and confirmed (Version {{ active_profile.version if active_profile else 1 }}).
+  </div>
+  {% endif %}
+
+  {% if active_profile %}
+  <div class="card-saas" style="padding: 20px 24px; margin-bottom: 24px;">
+    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+      <h2 style="font-size: 17px; font-weight: 750; margin: 0;">Active Candidate Profile</h2>
+      <span class="badge hot">Version {{ active_profile.version }}</span>
+    </div>
+    <p style="margin: 0 0 14px; font-size: 14px; color: var(--muted);">
+      Candidate: <strong style="color: var(--ink);">{{ active_profile.profile_data.basics.name or 'Unnamed Candidate' }}</strong> ({{ active_profile.profile_data.basics.email or 'No email' }})
+      &bull; Status: <span style="color: var(--good); font-weight: 700;">{{ active_profile.status }}</span>
+    </p>
+    <div style="display: flex; gap: 10px;">
+      <a href="/onboarding/review/{{ active_profile.id }}" class="btn-primary-saas" style="text-decoration: none; display: inline-block;">View / Edit Active Profile</a>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card-saas" style="padding: 28px 24px; margin-bottom: 24px;">
+    <h2 style="font-size: 18px; font-weight: 750; margin: 0 0 6px;">Upload Resume</h2>
+    <p style="font-size: 13.5px; color: var(--muted); margin: 0 0 20px;">
+      Accepted formats: PDF (<code class="mono">.pdf</code>) or Word (<code class="mono">.docx</code>). Maximum size: 5 MB.
+    </p>
+
+    <form action="/onboarding/upload" method="post" enctype="multipart/form-data" style="display: grid; gap: 18px;">
+      <input type="hidden" name="token" value="{{ csrf_token or token }}">
+
+      <div style="border: 2px dashed var(--line); border-radius: 12px; padding: 36px 20px; text-align: center; background: var(--raise); transition: border-color 0.2s;">
+        <svg class="i" style="width: 40px; height: 40px; color: var(--accent); margin-bottom: 12px;"><use href="#i-file"/></svg>
+        <div style="margin-bottom: 12px; font-size: 14px;">
+          <label for="resume-file" style="cursor: pointer; font-weight: 700; color: var(--accent); text-decoration: underline;">
+            Choose a file
+          </label>
+          <span style="color: var(--muted);"> or drag and drop here</span>
+        </div>
+        <input id="resume-file" type="file" name="file" accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" required style="font: inherit; font-size: 13px;">
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 8px; flex-wrap: wrap; gap: 12px;">
+        <a href="/onboarding/manual" style="font-size: 13.5px; color: var(--muted); text-decoration: none;">
+          Have a scanned resume? <span style="text-decoration: underline; color: var(--accent); font-weight: 600;">Enter details manually &rarr;</span>
+        </a>
+        <button type="submit" class="btn-primary-saas" style="font-size: 14px; padding: 10px 22px; cursor: pointer;">
+          Extract & Review Profile
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card-saas" style="padding: 16px 20px; font-size: 13px; color: var(--muted); background: var(--raise);">
+    <p style="margin: 0 0 8px; font-weight: 700; color: var(--ink); font-size: 13.5px;">Privacy & Candidate Isolation</p>
+    <ul style="margin: 0; padding-left: 20px; line-height: 1.6;">
+      <li>Your uploaded resume is validated locally with strict size, format, and magic-byte checks.</li>
+      <li>Data is tied to your signed browser session. Other candidates cannot access or modify your profile.</li>
+      <li>All extracted details are presented for your review before being confirmed into your profile version.</li>
+    </ul>
+  </div>
+</div>
+{% endblock %}

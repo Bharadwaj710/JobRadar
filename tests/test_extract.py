@@ -18,9 +18,15 @@ MODEL = "gemini/gemini-flash-lite-latest"
 
 
 class FakeFetcher:
-    def __init__(self, result: Page | Exception) -> None:
+    def __init__(
+        self,
+        result: Page | Exception,
+        greenhouse_result: Page | Exception | None = None,
+    ) -> None:
         self.result = result
+        self.greenhouse_result = greenhouse_result
         self.urls: list[str] = []
+        self.greenhouse_calls: list[tuple[str, str, str]] = []
 
     async def fetch(self, url: str) -> Page:
         self.urls.append(url)
@@ -28,12 +34,36 @@ class FakeFetcher:
             raise self.result
         return self.result
 
+    async def fetch_greenhouse_detail(self, board: str, posting_id: str, original_url: str) -> Page:
+        self.greenhouse_calls.append((board, posting_id, original_url))
+        if isinstance(self.greenhouse_result, Exception):
+            raise self.greenhouse_result
+        if self.greenhouse_result is None:
+            raise AssertionError("Greenhouse detail was not expected")
+        return self.greenhouse_result
+
 
 def seed(repo: Repo, text: str = "🔥 SDE Intern at Acme\nhttps://acme.com/j/1") -> None:
     src = repo.upsert_source(Platform.TELEGRAM, "-1001", "Jobs")
     assert src.id is not None
     raw_id, _ = repo.save_raw_message(src.id, "1", "2026-10-07T08:00:00.000000Z", text)
     repo.get_or_create_job("job1", "https://acme.com/j/1")
+    repo.add_job_source("job1", raw_id)
+
+
+def seed_greenhouse(
+    repo: Repo,
+    board: str,
+    posting_id: str,
+    url: str,
+    company: str,
+    role: str,
+) -> None:
+    src = repo.upsert_source(Platform.BOARD, f"greenhouse:{board}", f"Greenhouse · {company}")
+    assert src.id is not None
+    post = f"Company: {company}\nRole: {role}\nLocation: Bengaluru, India\n{url}"
+    raw_id, _ = repo.save_raw_message(src.id, posting_id, "2026-11-17T08:00:00.000000Z", post)
+    repo.get_or_create_job("job1", url)
     repo.add_job_source("job1", raw_id)
 
 
@@ -73,7 +103,7 @@ async def test_fetch_then_extract_fills_the_job(
     assert (job.company, job.role, job.deadline, job.status) == (
         "Acme", "SDE Intern", "2026-10-30", JobStatus.EXTRACTED.value,
     )  # fmt: skip
-    assert job.prompt_version == "rules-v1+extract-v1"  # no labels in the post: LLM ran
+    assert job.prompt_version == "rules-v3+extract-v1"  # no labels in the post: LLM ran
     data = json.loads(job.data_json or "{}")
     assert data["batch_years"] == [2026]
     assert data["_sources"]["role"] == "llm"
@@ -96,6 +126,98 @@ async def test_unusable_page_falls_back_to_the_post(
     assert "(page not available: use the message)" in fake.calls[0]["messages"][0]["content"]
     page = repo.get_page("job1")
     assert page is not None and page.note == "login required"
+
+
+async def test_incomplete_greenhouse_page_uses_official_detail(
+    repo: Repo, queue: TaskQueue, clock: FakeClock
+) -> None:
+    url = "https://job-boards.greenhouse.io/hackerrank/jobs/8229735"
+    seed_greenhouse(repo, "hackerrank", "8229735", url, "HackerRank", "SDE Intern")
+    short = Page(url, "SDE Intern", "Join our engineering internship. " * 15)
+    official = "https://job-boards.greenhouse.io/hackerrank/jobs/8229735"
+    detail_text = "What you will do\nBuild reliable software with Python and SQL. " * 60
+    structured = {
+        "@type": "JobPosting",
+        "title": "Software Development Engineer Intern",
+        "description": detail_text,
+    }
+    fetcher = FakeFetcher(
+        short,
+        Page(official, "Software Development Engineer Intern", detail_text, structured=structured),
+    )
+    ex = extractor(repo, queue, clock, fetcher, FakeCompletion())
+    queue.enqueue(FETCH, "job1")
+
+    await run(queue, ex)
+
+    page = repo.get_page("job1")
+    job = repo.get_job("job1")
+    sightings = repo.job_sightings("job1")
+    assert page is not None and page.text == detail_text
+    assert page.final_url == official
+    assert job is not None and job.canonical_url == url
+    assert [(s.chat_id, s.message_id) for s in sightings] == [("greenhouse:hackerrank", "8229735")]
+    assert fetcher.greenhouse_calls == [("hackerrank", "8229735", url)]
+
+
+async def test_blocked_greenhouse_page_uses_official_detail(
+    repo: Repo, queue: TaskQueue, clock: FakeClock
+) -> None:
+    url = "https://rubrik.com/company/careers/departments/job.8166537?gh_jid=8166537"
+    seed_greenhouse(repo, "rubrik", "8166537", url, "Rubrik", "Winter Intern")
+    detail_text = "Required qualifications\nPython or Java. Current students may apply. " * 50
+    detail_url = "https://www.rubrik.com/company/careers/departments/job.8166537?gh_jid=8166537"
+    fetcher = FakeFetcher(
+        Page(url, None, None, "HTTP 403"),
+        Page(detail_url, "Winter Intern", detail_text, structured={"@type": "JobPosting"}),
+    )
+    ex = extractor(repo, queue, clock, fetcher, FakeCompletion())
+    queue.enqueue(FETCH, "job1")
+
+    await run(queue, ex)
+
+    page = repo.get_page("job1")
+    assert page is not None and (page.final_url, page.text) == (detail_url, detail_text)
+    assert fetcher.greenhouse_calls == [("rubrik", "8166537", url)]
+
+
+async def test_non_greenhouse_short_page_does_not_use_detail(
+    repo: Repo, queue: TaskQueue, clock: FakeClock
+) -> None:
+    seed(repo)
+    fetcher = FakeFetcher(Page("https://acme.com/j/1", "SDE Intern", "Short page"))
+    fake = FakeCompletion({"company": "Acme", "role": "SDE Intern", "confidence": 0.9})
+    ex = extractor(repo, queue, clock, fetcher, fake)
+    queue.enqueue(FETCH, "job1")
+
+    await run(queue, ex)
+
+    assert fetcher.greenhouse_calls == []
+
+
+async def test_temporary_greenhouse_detail_failure_uses_task_retry(
+    repo: Repo, queue: TaskQueue, clock: FakeClock
+) -> None:
+    url = "https://rubrik.com/company/careers/departments/job.8166537?gh_jid=8166537"
+    seed_greenhouse(repo, "rubrik", "8166537", url, "Rubrik", "Winter Intern")
+    fetcher = FakeFetcher(
+        Page(url, None, None, "HTTP 403"),
+        RetryableError("boards-api.greenhouse.io answered 503", status=503),
+    )
+    ex = extractor(repo, queue, clock, fetcher, FakeCompletion())
+    queue.enqueue(FETCH, "job1")
+    task = queue.claim([FETCH])
+    assert task is not None
+
+    try:
+        await ex.fetch(task)
+    except RetryableError as error:
+        assert error.status == 503
+    else:
+        raise AssertionError("expected a retry")
+
+    assert repo.get_page("job1") is None
+    assert queue.claim([EXTRACT]) is None
 
 
 async def test_site_that_keeps_failing_is_skipped_late(
@@ -165,13 +287,48 @@ async def test_labelled_post_skips_the_llm(repo: Repo, queue: TaskQueue, clock: 
     assert fake.calls == []
     job = repo.get_job("job1")
     assert job is not None and job.status == JobStatus.EXTRACTED
-    assert (job.company, job.role, job.prompt_version) == ("Acme", "SDE Intern", "rules-v1")
+    assert (job.company, job.role, job.prompt_version) == ("Acme", "SDE Intern", "rules-v3")
     data = json.loads(job.data_json or "{}")
     assert data["batch_years"] == [2026]
     assert data["_sources"] == {
         "company": "post_labels", "role": "post_labels", "batch_years": "post_labels",
         "employment_type": "post_labels",  # "Intern" in the role
+        "role_tracks": "requirements_rules",
     }  # fmt: skip
+
+
+async def test_deterministic_requirements_are_saved_without_an_llm(
+    repo: Repo, queue: TaskQueue, clock: FakeClock
+) -> None:
+    seed(repo, "Company: Acme\nRole: Software Engineer Intern\nhttps://acme.com/j/1")
+    page = Page(
+        "u",
+        "Software Engineer Intern | Acme",
+        """Responsibilities:
+        Build backend APIs using Python and FastAPI.
+        Preferred qualifications:
+        Kubernetes is a plus.
+        We primarily use Ruby and Go.
+        No experience required.""",
+    )
+    fake = FakeCompletion()
+    ex = extractor(repo, queue, clock, FakeFetcher(page), fake)
+    queue.enqueue(FETCH, "job1")
+    await run(queue, ex)
+
+    assert fake.calls == []
+    job = repo.get_job("job1")
+    assert job is not None and job.data_json
+    data = json.loads(job.data_json)
+    assert data["skills_required"] == ["Python", "FastAPI"]
+    assert data["skills_preferred"] == ["Kubernetes"]
+    assert {item["track"]: item["strength"] for item in data["role_tracks"]} == {
+        "ai_backend": "strong",
+        "sde": "strong",
+    }
+    assert data["requirements"]["employer_technologies"][0]["skills"] == ["Ruby", "Go"]
+    assert data["experience_min"] == 0
+    assert data["_sources"]["requirements"] == "requirements_rules"
 
 
 async def test_page_data_wins_and_llm_fills_the_rest(
@@ -217,7 +374,7 @@ async def test_post_with_several_jobs_does_not_lend_its_labels(
     queue.enqueue(EXTRACT, "job1")
     await run(queue, ex)  # now the labels are this job's own: no LLM call needed
     job = repo.get_job("job1")
-    assert job is not None and job.prompt_version == "rules-v1"
+    assert job is not None and job.prompt_version == "rules-v3"
 
 
 async def test_always_mode_asks_the_llm_but_labels_win(
@@ -252,7 +409,7 @@ async def test_llm_failure_keeps_what_labels_found(
     await run(queue, ex)
     job = repo.get_job("job1")
     assert job is not None and job.status == JobStatus.EXTRACTED
-    assert job.prompt_version == "rules-v1"
+    assert job.prompt_version == "rules-v3"
 
 
 async def test_without_an_llm_key(repo: Repo, queue: TaskQueue, clock: FakeClock) -> None:

@@ -12,7 +12,8 @@
 {%- endmacro %}
 
 {% macro status(c) -%}
-<span class="status s-{{ c.status }}">{{ c.status_label }}</span>
+{% if c.closed_by_employer %}<span class="status s-closed">Closed</span>
+{% else %}<span class="status s-{{ c.status }}">{{ c.status_label }}</span>{% endif %}
 {%- endmacro %}
 
 {% macro reasons(r) -%}
@@ -56,14 +57,37 @@
     <p class="meta">
       {% if c.company %}<b>{{ c.company }}</b>{% endif %}
       {% if c.place %}<span><svg class="i xs"><use href="#i-pin"/></svg>{{ c.place }}</span>{% endif %}
+      {% if c.work_mode and c.work_mode not in c.place %}<span>{{ c.work_mode }}</span>{% endif %}
+      {% if c.published %}<span>posted {{ c.published }}</span>{% endif %}
       {% set n = c.closes_in %}
       {% if n is not none and n >= 0 %}<span class="due {{ 'soon' if n <= 3 else '' }}"><svg class="i xs"><use href="#i-clock"/></svg>{% if n == 0 %}closes today{% elif n == 1 %}closes tomorrow{% else %}closes in {{ n }} days{% endif %}</span>{% elif c.closes %}<span class="due over">closed {{ c.closes }}</span>{% endif %}
     </p>
+    {% if c.track_match %}{% set t = c.track_match %}
+      {% if t.state in ('current', 'partial') %}
+      <div class="track-line">
+        {% if t.primary_label %}<span class="track primary">{{ t.primary_label }}</span>{% endif %}
+        {% for label in t.secondary %}<span class="track secondary">{{ label }}</span>{% endfor %}
+        <span class="technical {{ 'unscored' if t.score is none else '' }}">Technical fit {{ t.score if t.score is not none else 'unscored' }}</span>
+        {% if t.evidence is not none %}<span class="coverage">{{ t.evidence }}% evidence</span>{% endif %}
+        {% if t.eligibility_label %}<span class="eligibility e-{{ t.eligibility|lower }}">{{ t.eligibility_label }}</span>{% endif %}
+        {% if t.resume %}<span class="resume-rec">{{ t.resume }}</span>{% endif %}
+      </div>
+      {% if t.message %}<p class="track-note">{{ t.message }}</p>{% endif %}
+      {% else %}<p class="track-note {{ t.state }}">{{ t.message }}</p>{% endif %}
+    {% endif %}
+    {% if c.lead %}{% set lead = c.lead %}
+      <div class="lead-line {{ lead.state }}">
+        <span class="lead-priority p-{{ lead.priority }}">{{ lead.priority_label }}</span>
+        <span>Reviewed track {{ lead.primary_track_label }}</span>
+        <span class="lead-vacancy v-{{ lead.vacancy|lower }}">Vacancy {{ lead.vacancy|lower }}</span>
+        {% if lead.state == 'stale' %}<span class="lead-stale">Older profile {{ lead.profile_version }}</span>{% endif %}
+      </div>
+    {% endif %}
     {% if snippet %}<p class="snippet">{{ snippet }}</p>{% endif %}
     {{ reasons(c.reason) }}
   </div>
   <div class="row-end">
-    {{ ring(c.score) }}
+    {% if c.score is not none %}{{ ring(c.score) }}{% elif c.historical_score is not none %}<span class="legacy-score" title="Legacy score: {{ c.historical_score }}">{{ c.historical_score }}<small>leg</small></span>{% else %}{{ ring(none) }}{% endif %}
     <span class="age" title="First seen {{ c.seen }}">{{ c.age or c.seen }}</span>
   </div>
   <div class="row-actions">

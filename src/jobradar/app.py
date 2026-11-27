@@ -11,7 +11,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from jobradar.config import ConfigError, Settings
-from jobradar.db.repo import DEFAULT_DB_PATH, Repo, TaskRecord, init_db, make_engine
+from jobradar.db.models import Candidate
+from jobradar.db.repo import (
+    OwnerResolutionError,
+    Repo,
+    TaskRecord,
+    init_db,
+    make_engine,
+)
 from jobradar.llm import LLM, load_prompt
 from jobradar.pipeline.extract import Extractor, backfill_published, backfill_role_keys
 from jobradar.pipeline.fetch import Fetcher
@@ -40,6 +47,7 @@ from jobradar.pipeline.task_types import (
     REPLY_CHECK,
     SEND_ALERTS,
 )
+from jobradar.pipeline.technical_match import track_profile_version
 from jobradar.profile import compact_profile, load_profile, profile_version, skill_warnings
 from jobradar.providers.base import MatchProvider
 from jobradar.providers.llm import LLMProvider
@@ -64,7 +72,7 @@ log = logging.getLogger(__name__)
 
 
 def open_store() -> tuple[Repo, TaskQueue]:
-    engine = make_engine(DEFAULT_DB_PATH)
+    engine = make_engine()
     init_db(engine)
     repo = Repo(engine)
     return repo, TaskQueue(repo)
@@ -89,7 +97,9 @@ def make_ingest(
     return ingest, expander
 
 
-def make_alerts(settings: Settings, repo: Repo, queue: TaskQueue) -> AlertSender | None:
+def make_alerts(
+    settings: Settings, repo: Repo, queue: TaskQueue, candidate_id: str | None = None
+) -> AlertSender | None:
     """Email alerts, or None (with a warning) when they are off or email isn't set up."""
     notify = settings.config.notify
     if not notify.alerts:
@@ -97,10 +107,12 @@ def make_alerts(settings: Settings, repo: Repo, queue: TaskQueue) -> AlertSender
     if not notify.dry_run and (missing := settings.missing("email")):
         log.warning("email alerts are off: add to .env " + ", ".join(missing))
         return None
-    return AlertSender(settings, repo, queue)
+    return AlertSender(settings, repo, queue, candidate_id=candidate_id)
 
 
-def make_digest(settings: Settings, repo: Repo, queue: TaskQueue) -> Digest | None:
+def make_digest(
+    settings: Settings, repo: Repo, queue: TaskQueue, candidate_id: str | None = None
+) -> Digest | None:
     """The digest, or None (with a warning) when it is off or email isn't set up."""
     notify = settings.config.notify
     if not notify.digest or not notify.digest_times:
@@ -108,11 +120,15 @@ def make_digest(settings: Settings, repo: Repo, queue: TaskQueue) -> Digest | No
     if not notify.dry_run and (missing := settings.missing("email")):
         log.warning("digest is off: add to .env " + ", ".join(missing))
         return None
-    return Digest(settings, repo, queue)
+    return Digest(settings, repo, queue, candidate_id=candidate_id)
 
 
 def make_reminders(
-    settings: Settings, repo: Repo, queue: TaskQueue, liveness: LivenessChecker
+    settings: Settings,
+    repo: Repo,
+    queue: TaskQueue,
+    liveness: LivenessChecker,
+    candidate_id: str | None = None,
 ) -> ClosingReminder | None:
     """Closing-soon reminders, or None when they are off or email isn't set up."""
     notify = settings.config.notify
@@ -121,10 +137,12 @@ def make_reminders(
     if not notify.dry_run and (missing := settings.missing("email")):
         log.warning("closing reminders are off: add to .env " + ", ".join(missing))
         return None
-    return ClosingReminder(settings, repo, queue, liveness)
+    return ClosingReminder(settings, repo, queue, liveness, candidate_id=candidate_id)
 
 
-def make_followups(settings: Settings, repo: Repo, queue: TaskQueue) -> FollowUpReminder | None:
+def make_followups(
+    settings: Settings, repo: Repo, queue: TaskQueue, candidate_id: str | None = None
+) -> FollowUpReminder | None:
     """Follow-up reminders, or None when they are off or email isn't set up."""
     notify = settings.config.notify
     if not notify.followups:
@@ -132,7 +150,7 @@ def make_followups(settings: Settings, repo: Repo, queue: TaskQueue) -> FollowUp
     if not notify.dry_run and (missing := settings.missing("email")):
         log.warning("follow-up reminders are off: add to .env " + ", ".join(missing))
         return None
-    return FollowUpReminder(settings, repo, queue)
+    return FollowUpReminder(settings, repo, queue, candidate_id=candidate_id)
 
 
 def make_replies(settings: Settings, repo: Repo, queue: TaskQueue) -> ReplyReader | None:
@@ -182,12 +200,16 @@ def make_matcher(
         return None
     # A new prompt asks different questions: match open jobs again, as for a profile edit.
     version = profile_version({**profile, "_prompt": load_prompt("match").version})
+    track_version = track_profile_version(full, datetime.now(config.notify.tz).date())
     return Matcher(
         repo, queue, providers, profile, version, config.matching,
         config.filters, config.scoring, alerts,
         alert_max_age_days=config.notify.alert_max_age_days, tz=config.notify.tz,
         old_posting_days=config.notify.old_posting_days,
         liveness=liveness, build_resumes=build_resumes,
+        track_profile=full if track_version is not None else None,
+        track_version=track_version,
+        candidate_independent=getattr(config.matching, "candidate_independent", False),
     )  # fmt: skip
 
 
@@ -197,6 +219,11 @@ class Pipeline:
     def __init__(
         self, settings: Settings, repo: Repo, queue: TaskQueue, sink: notion.NotionSink | None
     ):
+        self.owner_candidate: Candidate | None = None
+        try:
+            self.owner_candidate = repo.resolve_owner_candidate_from_settings(settings)
+        except OwnerResolutionError as e:
+            log.debug("Legacy owner candidate not resolved for pipeline: %s", e)
         self.ingest, self.expander = make_ingest(settings, repo, queue)
         self.fetcher = Fetcher()
         handlers: dict[str, Handler] = {PROCESS_MESSAGE: self.ingest.process_message}
@@ -209,7 +236,8 @@ class Pipeline:
                 handlers[kind] = _skip
         llm_config = settings.config.llm
         llm = LLM(settings, repo) if llm_enabled(settings) else None  # shared: one rate limit
-        alerts = make_alerts(settings, repo, queue)
+        owner_cid = self.owner_candidate.id if self.owner_candidate else None
+        alerts = make_alerts(settings, repo, queue, candidate_id=owner_cid)
         self.liveness = LivenessChecker()
         self.resumes = (
             ResumeBuilder(settings, repo, queue, llm) if settings.config.resume.enabled else None
@@ -255,16 +283,18 @@ class Pipeline:
                 settings.config.sources.freehire, repo, queue, make_emit(repo, queue)
             )
             handlers[FREEHIRE_CHECK] = self.freehire.tick
-        self.digest = make_digest(settings, repo, queue)
+        self.digest = make_digest(settings, repo, queue, candidate_id=owner_cid)
         if self.digest is not None:
             handlers[DIGEST] = self.digest.send
-        self.reminders = make_reminders(settings, repo, queue, self.liveness)
+        self.reminders = make_reminders(
+            settings, repo, queue, self.liveness, candidate_id=owner_cid
+        )
         if self.reminders is not None:
             handlers[CLOSING_CHECK] = self.reminders.tick
         self.replies = make_replies(settings, repo, queue)
         if self.replies is not None:
             handlers[REPLY_CHECK] = self.replies.tick
-        self.followups = make_followups(settings, repo, queue)
+        self.followups = make_followups(settings, repo, queue, candidate_id=owner_cid)
         if self.followups is not None:
             handlers[FOLLOWUP_CHECK] = self.followups.tick
         self.worker = Worker(queue, handlers, concurrency=4)

@@ -7,40 +7,67 @@ statements, so they stay atomic even if the process dies between calls.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
-from collections.abc import Iterator
+import uuid
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import Engine, bindparam, event, text
 from sqlalchemy.engine import Connection
-from sqlalchemy.schema import CreateTable
+from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlmodel import Session, SQLModel, col, create_engine, func, select
 
 from jobradar.clock import Clock, to_iso, utcnow
 from jobradar.db import models  # also registers every table on SQLModel.metadata
 from jobradar.db.models import (
     Artifact,
+    Candidate,
+    CandidateApplication,
+    CandidateApplicationHistory,
+    CandidateApplicationStatus,
+    CandidateHistoricalAssessment,
+    CandidateJobAssessment,
+    CandidateProfile,
     FeedBoard,
     FetchedPage,
     Job,
+    JobLead,
     JobStatus,
+    JobTrackMatch,
     Platform,
     RawMessage,
+    Resume,
     Source,
     TaskStatus,
     WatchedPage,
 )
 
-DEFAULT_DB_PATH = Path("data/jobradar.db")
+if TYPE_CHECKING:
+    from jobradar.config import Settings
+    from jobradar.pipeline.eligibility import EligibilityResult
+    from jobradar.pipeline.leads import LeadEnrichment
+    from jobradar.pipeline.technical_match import FourTrackAssessment, TrackAssessment
 
 
-def make_engine(path: Path = DEFAULT_DB_PATH) -> Engine:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(f"sqlite:///{path}")
+def get_default_db_path() -> Path:
+    env_path = os.environ.get("JOBRADAR_DB_PATH")
+    if env_path:
+        return Path(env_path)
+    return Path("data/jobradar.db")
+
+
+DEFAULT_DB_PATH = get_default_db_path()
+
+
+def make_engine(path: Path | None = None) -> Engine:
+    target_path = path or get_default_db_path()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_engine(f"sqlite:///{target_path}")
 
     @event.listens_for(engine, "connect")
     def _pragmas(dbapi_conn: Any, _record: Any) -> None:
@@ -54,10 +81,41 @@ def make_engine(path: Path = DEFAULT_DB_PATH) -> Engine:
     return engine
 
 
+class OwnerResolutionError(RuntimeError):
+    """Raised when the owner candidate cannot be safely or unambiguously resolved."""
+
+
 def init_db(engine: Engine) -> None:
     SQLModel.metadata.create_all(engine)
     _add_new_columns(engine)
     _refresh_source_platforms(engine)
+    _refresh_candidate_application_statuses(engine)
+
+
+def backup_database(engine: Engine, destination: Path) -> Path:
+    """Create and integrity-check a consistent SQLite online backup.
+
+    SQLite's backup API includes committed WAL contents while readers such as the dashboard are
+    connected.  Refusing to overwrite makes the backup safe to use as a migration checkpoint.
+    """
+
+    if destination.exists():
+        raise FileExistsError(f"backup already exists: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    raw = engine.raw_connection()
+    target = sqlite3.connect(destination)
+    try:
+        dbapi = raw.driver_connection
+        if dbapi is None:
+            raise RuntimeError("no database connection available for backup")
+        dbapi.backup(target)
+        check = target.execute("PRAGMA integrity_check").fetchone()
+        if check is None or check[0] != "ok":
+            raise RuntimeError(f"database backup failed integrity check: {check}")
+    finally:
+        target.close()
+        raw.close()
+    return destination
 
 
 def _refresh_source_platforms(engine: Engine) -> None:
@@ -107,6 +165,83 @@ def _refresh_source_platforms(engine: Engine) -> None:
         raw.close()
 
 
+def _refresh_candidate_application_statuses(engine: Engine) -> None:
+    """SQLite can't change a CHECK constraint in place, so when a new application status
+    appears (e.g. 'skipped'), candidate_application is rebuilt with the new constraint."""
+    with engine.connect() as c:
+        sql = c.execute(
+            text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'candidate_application'"
+            )
+        ).scalar()
+    if sql is None:
+        return
+    if "'skipped'" in sql:
+        return
+    raw = engine.raw_connection()
+    try:
+        dbapi = raw.driver_connection
+        if dbapi is None:
+            raise RuntimeError("no database connection to rebuild `candidate_application` with")
+        if path := engine.url.database:
+            backup = sqlite3.connect(f"{path}.before-skipped-application-status.bak")
+            dbapi.backup(backup)
+            backup.close()
+        # Capture existing triggers before rename
+        triggers = dbapi.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'candidate_application'"
+        ).fetchall()
+        columns = ", ".join(c.name for c in models.CandidateApplication.__table__.columns)  # type: ignore[attr-defined]
+        create = str(CreateTable(models.CandidateApplication.__table__).compile(engine))  # type: ignore[attr-defined]
+
+        # SQLite does not allow PRAGMA foreign_keys inside an active transaction.
+        if getattr(dbapi, "in_transaction", False):
+            dbapi.commit()
+        dbapi.execute("PRAGMA foreign_keys = OFF")
+        fk_status = dbapi.execute("PRAGMA foreign_keys").fetchone()
+        if fk_status and fk_status[0] != 0:
+            raise RuntimeError(
+                "Failed to disable foreign keys prior to candidate_application rebuild"
+            )
+        dbapi.execute("PRAGMA legacy_alter_table = ON")
+        in_tx = False
+        try:
+            dbapi.execute("BEGIN IMMEDIATE")
+            in_tx = True
+            dbapi.execute("ALTER TABLE candidate_application RENAME TO candidate_application_old")
+            dbapi.execute(create)
+            dbapi.execute(
+                f"INSERT INTO candidate_application ({columns}) "  # noqa: S608
+                f"SELECT {columns} FROM candidate_application_old"
+            )
+            dbapi.execute("DROP TABLE candidate_application_old")
+            # Recreate all model indexes
+            for idx in models.CandidateApplication.__table__.indexes:  # type: ignore[attr-defined]
+                dbapi.execute(str(CreateIndex(idx).compile(engine)))
+            # Recreate all preserved triggers
+            for _trg_name, trg_sql in triggers:
+                if trg_sql:
+                    dbapi.execute(trg_sql)
+            problems = dbapi.execute("PRAGMA foreign_key_check").fetchall()
+            if problems:
+                raise RuntimeError(
+                    f"foreign key problems after rebuilding candidate_application: {problems[:3]}"
+                )
+            dbapi.execute("COMMIT")
+            in_tx = False
+        except Exception:
+            if in_tx:
+                dbapi.execute("ROLLBACK")
+            raise
+        finally:
+            dbapi.execute("PRAGMA legacy_alter_table = OFF")
+            dbapi.execute("PRAGMA foreign_keys = ON")
+    finally:
+        raw.close()
+
+
 def _add_new_columns(engine: Engine) -> None:
     """create_all makes missing tables but not columns added to existing ones. Adds them;
     only nullable columns may be added to an existing table."""
@@ -140,6 +275,14 @@ class TaskRecord:
     key: str
     payload: dict[str, Any]
     attempts: int  # including the current attempt
+
+
+@dataclass(frozen=True)
+class TrackDashboardCounts:
+    total_jobs: int
+    assessed_jobs: int
+    stale_jobs: int
+    eligibility: dict[str, int]
 
 
 class Repo:
@@ -628,13 +771,13 @@ class Repo:
 
     def same_role_main(self, job_id: str, fingerprint: str, since: str) -> str | None:
         """The oldest open job with this company and role, first seen since `since` and
-        before this one, that you haven't moved in Notion; None if there is none."""
+        before this one; None if there is none."""
         with self._tx() as c:
             row = c.execute(
                 text(
                     """
                     SELECT id FROM job
-                    WHERE fingerprint = :fp AND id != :id AND user_status_at IS NULL
+                    WHERE fingerprint = :fp AND id != :id
                       AND status IN ('extracted', 'new') AND created_at >= :since
                       AND created_at < (SELECT created_at FROM job WHERE id = :id)
                     ORDER BY created_at, id LIMIT 1
@@ -659,11 +802,20 @@ class Repo:
             self.touch_job(to_job)
         return int(result.rowcount or 0)
 
-    def set_job_data(self, job_id: str, data_json: str) -> None:
+    def set_job_data(self, job_id: str, data_json: str, prompt_version: str | None = None) -> None:
         with self._tx() as c:
             c.execute(
-                text("UPDATE job SET data_json = :data, updated_at = :now WHERE id = :id"),
-                {"id": job_id, "data": data_json, "now": self._now()},
+                text(
+                    "UPDATE job SET data_json = :data, "
+                    "prompt_version = coalesce(:version, prompt_version), updated_at = :now "
+                    "WHERE id = :id"
+                ),
+                {
+                    "id": job_id,
+                    "data": data_json,
+                    "version": prompt_version,
+                    "now": self._now(),
+                },
             )
 
     # ---- matching -----------------------------------------------------------------------------
@@ -684,6 +836,232 @@ class Repo:
                 {"job": job_id, "version": version, "provider": provider,
                  "answers": answers_json, "now": self._now()},
             )  # fmt: skip
+
+    @staticmethod
+    def _upsert_track_match(
+        c: Connection,
+        job_id: str,
+        version: str,
+        assessment: TrackAssessment,
+        eligibility: EligibilityResult,
+        now: str,
+    ) -> None:
+        c.execute(
+            text(
+                """
+                INSERT INTO job_track_match (
+                    job_id, profile_version, track, technical_score, evidence_coverage,
+                    eligibility_status, recommended_resume, explanation, assessment_json,
+                    eligibility_json, created_at, updated_at
+                ) VALUES (
+                    :job, :version, :track, :score, :coverage, :eligibility,
+                    :resume, :explanation, :assessment_json, :eligibility_json, :now, :now
+                )
+                ON CONFLICT (job_id, profile_version, track) DO UPDATE SET
+                    technical_score = excluded.technical_score,
+                    evidence_coverage = excluded.evidence_coverage,
+                    eligibility_status = excluded.eligibility_status,
+                    recommended_resume = excluded.recommended_resume,
+                    explanation = excluded.explanation,
+                    assessment_json = excluded.assessment_json,
+                    eligibility_json = excluded.eligibility_json,
+                    updated_at = excluded.updated_at
+                """
+            ),
+            {
+                "job": job_id,
+                "version": version,
+                "track": assessment.track,
+                "score": assessment.score,
+                "coverage": assessment.evidence_coverage,
+                "eligibility": eligibility.state.value,
+                "resume": assessment.recommended_resume,
+                "explanation": assessment.explanation,
+                "assessment_json": assessment.model_dump_json(),
+                "eligibility_json": eligibility.model_dump_json(),
+                "now": now,
+            },
+        )
+
+    def save_track_assessment(
+        self,
+        job_id: str,
+        version: str,
+        assessment: TrackAssessment,
+        eligibility: EligibilityResult,
+    ) -> None:
+        """Upsert one track result without changing the job's legacy score or match answers."""
+
+        with self._tx() as c:
+            self._upsert_track_match(c, job_id, version, assessment, eligibility, self._now())
+
+    def save_track_assessments(self, job_id: str, version: str, result: FourTrackAssessment) -> int:
+        """Upsert every available track atomically; return the number supplied."""
+
+        assessments = list(result.tracks.values())
+        now = self._now()
+        with self._tx() as c:
+            for assessment in assessments:
+                self._upsert_track_match(c, job_id, version, assessment, result.eligibility, now)
+        return len(assessments)
+
+    def get_track_match(self, job_id: str, version: str, track: str) -> JobTrackMatch | None:
+        with Session(self.engine) as s:
+            return s.get(JobTrackMatch, (job_id, version, track))
+
+    def track_matches_for_job(self, job_id: str, version: str | None = None) -> list[JobTrackMatch]:
+        statement = select(JobTrackMatch).where(col(JobTrackMatch.job_id) == job_id)
+        if version is not None:
+            statement = statement.where(col(JobTrackMatch.profile_version) == version)
+        statement = statement.order_by(col(JobTrackMatch.profile_version), col(JobTrackMatch.track))
+        with Session(self.engine) as s:
+            return list(s.exec(statement).all())
+
+    def track_matches_for_jobs(
+        self, job_ids: list[str], version: str | None = None
+    ) -> list[JobTrackMatch]:
+        """Track rows for a page of jobs in one query; never mixes versions unless requested."""
+
+        if not job_ids:
+            return []
+        statement = select(JobTrackMatch).where(col(JobTrackMatch.job_id).in_(job_ids))
+        if version is not None:
+            statement = statement.where(col(JobTrackMatch.profile_version) == version)
+        statement = statement.order_by(
+            col(JobTrackMatch.job_id), col(JobTrackMatch.profile_version), col(JobTrackMatch.track)
+        )
+        with Session(self.engine) as s:
+            return list(s.exec(statement).all())
+
+    def track_matches_for_track(
+        self, track: str, version: str | None = None
+    ) -> list[JobTrackMatch]:
+        statement = select(JobTrackMatch).where(col(JobTrackMatch.track) == track)
+        if version is not None:
+            statement = statement.where(col(JobTrackMatch.profile_version) == version)
+        statement = statement.order_by(
+            col(JobTrackMatch.job_id), col(JobTrackMatch.profile_version)
+        )
+        with Session(self.engine) as s:
+            return list(s.exec(statement).all())
+
+    def track_matches_for_version(self, version: str) -> list[JobTrackMatch]:
+        statement = (
+            select(JobTrackMatch)
+            .where(col(JobTrackMatch.profile_version) == version)
+            .order_by(col(JobTrackMatch.job_id), col(JobTrackMatch.track))
+        )
+        with Session(self.engine) as s:
+            return list(s.exec(statement).all())
+
+    def save_job_lead(self, job_id: str, profile_version: str, enrichment: LeadEnrichment) -> None:
+        """Upsert the current verified lead without changing job or match records."""
+
+        now = self._now()
+        with self._tx() as c:
+            c.execute(
+                text(
+                    """
+                    INSERT INTO job_lead (
+                        job_id, profile_version, primary_track, vacancy_status,
+                        eligibility_status, application_priority, official_application_url,
+                        last_verified_at, enrichment_json, created_at, updated_at
+                    ) VALUES (
+                        :job, :version, :track, :vacancy, :eligibility, :priority,
+                        :application_url, :verified, :enrichment, :now, :now
+                    )
+                    ON CONFLICT (job_id) DO UPDATE SET
+                        profile_version = excluded.profile_version,
+                        primary_track = excluded.primary_track,
+                        vacancy_status = excluded.vacancy_status,
+                        eligibility_status = excluded.eligibility_status,
+                        application_priority = excluded.application_priority,
+                        official_application_url = excluded.official_application_url,
+                        last_verified_at = excluded.last_verified_at,
+                        enrichment_json = excluded.enrichment_json,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                {
+                    "job": job_id,
+                    "version": profile_version,
+                    "track": enrichment.primary_track,
+                    "vacancy": enrichment.vacancy_status,
+                    "eligibility": enrichment.eligibility_status,
+                    "priority": enrichment.application_priority,
+                    "application_url": enrichment.official_application_url,
+                    "verified": enrichment.last_verified_at.isoformat(),
+                    "enrichment": enrichment.model_dump_json(),
+                    "now": now,
+                },
+            )
+
+    def get_job_lead(self, job_id: str) -> JobLead | None:
+        with Session(self.engine) as s:
+            return s.get(JobLead, job_id)
+
+    def leads_for_jobs(self, job_ids: list[str]) -> list[JobLead]:
+        """Lead rows for a page of jobs in one query."""
+
+        if not job_ids:
+            return []
+        statement = (
+            select(JobLead)
+            .where(col(JobLead.job_id).in_(job_ids))
+            .order_by(col(JobLead.application_priority), col(JobLead.last_verified_at).desc())
+        )
+        with Session(self.engine) as s:
+            return list(s.exec(statement).all())
+
+    def leads_by_priority(self, priority: str, profile_version: str) -> list[JobLead]:
+        statement = (
+            select(JobLead)
+            .where(col(JobLead.application_priority) == priority)
+            .where(col(JobLead.profile_version) == profile_version)
+            .order_by(col(JobLead.last_verified_at).desc())
+        )
+        with Session(self.engine) as s:
+            return list(s.exec(statement).all())
+
+    def track_dashboard_counts(self, version: str | None) -> TrackDashboardCounts:
+        """Distinct-job counts for the active track profile, plus older-only stale jobs."""
+
+        with self._tx() as c:
+            total = int(c.execute(text("SELECT count(*) FROM job")).scalar_one())
+            stale = int(
+                c.execute(
+                    text(
+                        "SELECT count(DISTINCT old.job_id) FROM job_track_match old "
+                        "WHERE :version IS NULL OR NOT EXISTS (SELECT 1 FROM job_track_match cur "
+                        "WHERE cur.job_id = old.job_id AND cur.profile_version = :version)"
+                    ),
+                    {"version": version},
+                ).scalar_one()
+            )
+            if version is None:
+                return TrackDashboardCounts(total, 0, stale, {})
+            assessed = int(
+                c.execute(
+                    text(
+                        "SELECT count(DISTINCT job_id) FROM job_track_match "
+                        "WHERE profile_version = :version"
+                    ),
+                    {"version": version},
+                ).scalar_one()
+            )
+            rows = c.execute(
+                text(
+                    "SELECT eligibility_status, count(DISTINCT job_id) FROM job_track_match "
+                    "WHERE profile_version = :version GROUP BY eligibility_status"
+                ),
+                {"version": version},
+            ).all()
+        return TrackDashboardCounts(
+            total,
+            assessed,
+            stale,
+            {str(status): int(count) for status, count in rows},
+        )
 
     def ever_matched(self, job_id: str) -> bool:
         """True if this job has answers for any profile version."""
@@ -724,6 +1102,24 @@ class Repo:
                 {"version": version},
             ).all()
         return [str(r[0]) for r in rows]
+
+    def jobs_to_track_match(self, version: str, expected_tracks: int = 4) -> list[str]:
+        """Open jobs without a complete set of track rows for this profile version."""
+
+        with self._tx() as c:
+            rows = c.execute(
+                text(
+                    """
+                    SELECT id FROM job WHERE status IN ('extracted', 'new')
+                        AND (SELECT count(*) FROM job_track_match tm
+                            WHERE tm.job_id = job.id AND tm.profile_version = :version)
+                            < :expected
+                    ORDER BY created_at
+                    """
+                ),
+                {"version": version, "expected": expected_tracks},
+            ).all()
+        return [str(row[0]) for row in rows]
 
     def match_answers(self, version: str) -> list[tuple[str, str]]:
         """(job_id, answers_json) for open jobs matched against this profile version."""
@@ -806,6 +1202,22 @@ class Repo:
                     "GROUP BY status"
                 ),
                 {"since": since, "until": until},
+            ).all()
+        return {str(r[0]): int(r[1]) for r in rows}
+
+    def candidate_status_changes_since(
+        self, candidate_id: str, since: str, until: str | None = None
+    ) -> dict[str, int]:
+        """How many jobs this candidate moved into each status since `since`."""
+        with self._tx() as c:
+            rows = c.execute(
+                text(
+                    "SELECT status, count(DISTINCT job_id) FROM candidate_application_history "
+                    "WHERE candidate_id = :cand_id AND changed_at >= :since "
+                    "AND (:until IS NULL OR changed_at < :until) "
+                    "GROUP BY status"
+                ),
+                {"cand_id": candidate_id, "since": since, "until": until},
             ).all()
         return {str(r[0]): int(r[1]) for r in rows}
 
@@ -1039,9 +1451,17 @@ class Repo:
         min_score: int | None,
         since: str | None,
         source_id: int | None,
+        track_version: str | None,
+        track: str | None,
+        eligibility: str | None,
+        technical_min: int | None,
+        work_mode: str | None,
+        published_since: str | None,
+        priority: str | None,
         order: str,
         limit: int,
         offset: int,
+        candidate_id: str | None = None,
     ) -> tuple[list[tuple[Job, str | None]], int]:
         """A page of jobs for All jobs, with a text snippet around what `match` (an FTS5
         query) found, and how many match in all. `order`: new, old, score, or relevance."""
@@ -1057,8 +1477,17 @@ class Repo:
             where.append(f"j.status IN ({marks})" if statuses else "0 = 1")
             params |= {f"st{i}": st for i, st in enumerate(statuses)}
         if min_score is not None:
-            where.append("j.score >= :min")
-            params["min"] = min_score
+            if candidate_id:
+                where.append(
+                    "EXISTS (SELECT 1 FROM candidate_job_assessment cja "
+                    "WHERE cja.job_id = j.id AND cja.candidate_id = :cand_id "
+                    "AND cja.technical_score >= :min)"
+                )
+                params["cand_id"] = candidate_id
+                params["min"] = min_score
+            else:
+                where.append("j.score >= :min")
+                params["min"] = min_score
         if since is not None:
             where.append("j.created_at >= :since")
             params["since"] = since
@@ -1068,9 +1497,107 @@ class Repo:
                 " WHERE js.job_id = j.id AND m.source_id = :src)"
             )
             params["src"] = source_id
+        track_filters: list[str] = []
+        if track is not None:
+            track_filters.append("tm.track = :track")
+            track_filters.append(
+                "coalesce(json_extract(tm.assessment_json, "
+                "'$.components.role_alignment.value'), 0) > 0"
+            )
+            params["track"] = track
+        if eligibility is not None:
+            if eligibility.lower() == "eligible":
+                track_filters.append("tm.eligibility_status IN ('ELIGIBLE', 'LIKELY_ELIGIBLE')")
+            else:
+                track_filters.append("tm.eligibility_status = :eligibility")
+                params["eligibility"] = eligibility.upper()
+        if technical_min is not None:
+            track_filters.append("tm.technical_score >= :technical_min")
+            params["technical_min"] = technical_min
+        if candidate_id and (
+            track is not None or eligibility is not None or technical_min is not None
+        ):
+            cand_track_filters = ["cja.candidate_id = :cand_id"]
+            params["cand_id"] = candidate_id
+            if track is not None:
+                cand_track_filters.append("cja.track = :cand_track")
+                params["cand_track"] = track
+            if eligibility is not None:
+                if eligibility.lower() == "eligible":
+                    cand_track_filters.append(
+                        "cja.eligibility_status IN ('ELIGIBLE', 'LIKELY_ELIGIBLE')"
+                    )
+                else:
+                    cand_track_filters.append("cja.eligibility_status = :cand_eligibility")
+                    params["cand_eligibility"] = eligibility.upper()
+            if technical_min is not None:
+                cand_track_filters.append("cja.technical_score >= :cand_tech_min")
+                params["cand_tech_min"] = technical_min
+            where.append(
+                "EXISTS (SELECT 1 FROM candidate_job_assessment cja WHERE cja.job_id = j.id AND "  # noqa: S608
+                + " AND ".join(cand_track_filters)
+                + ")"
+            )
+        elif track_filters:
+            if track_version is None:
+                where.append("0 = 1")
+            else:
+                params["track_version"] = track_version
+                track_filters.insert(0, "tm.profile_version = :track_version")
+                # Only fixed clauses are joined here; every external value remains bound.
+                where.append(
+                    "EXISTS (SELECT 1 FROM job_track_match tm WHERE tm.job_id = j.id AND "  # noqa: S608
+                    + " AND ".join(track_filters)
+                    + ")"
+                )
+        if work_mode is not None:
+            where.append("json_extract(j.data_json, '$.work_mode') = :work_mode")
+            params["work_mode"] = work_mode
+        if published_since is not None:
+            where.append("date(json_extract(j.data_json, '$.published_on')) >= :published_since")
+            params["published_since"] = published_since
+        if priority is not None:
+            if track_version is None:
+                where.append("0 = 1")
+            else:
+                where.append(
+                    "EXISTS (SELECT 1 FROM job_lead lead WHERE lead.job_id = j.id "
+                    "AND lead.profile_version = :lead_version "
+                    "AND lead.application_priority = :priority)"
+                )
+                params["lead_version"] = track_version
+                params["priority"] = priority
+        if candidate_id and order == "score":
+            if track is not None:
+                join += (
+                    " LEFT JOIN ("
+                    "   SELECT job_id, MAX(technical_score) AS cand_max_score"
+                    "   FROM candidate_job_assessment"
+                    "   WHERE candidate_id = :cand_id AND track = :cand_sort_track"
+                    "   GROUP BY job_id"
+                    " ) cja_best ON cja_best.job_id = j.id"
+                )
+                params["cand_sort_track"] = track
+            else:
+                join += (
+                    " LEFT JOIN ("
+                    "   SELECT job_id, MAX(technical_score) AS cand_max_score"
+                    "   FROM candidate_job_assessment"
+                    "   WHERE candidate_id = :cand_id"
+                    "   GROUP BY job_id"
+                    " ) cja_best ON cja_best.job_id = j.id"
+                )
+            params["cand_id"] = candidate_id
+            score_order = (
+                "cja_best.cand_max_score IS NULL, cja_best.cand_max_score DESC, "
+                "j.created_at DESC, j.id DESC"
+            )
+        else:
+            score_order = "j.score IS NULL, j.score DESC, j.created_at DESC, j.id DESC"
+
         by = {
             "old": "j.created_at, j.id",
-            "score": "j.score IS NULL, j.score DESC, j.created_at DESC",
+            "score": score_order,
             "relevance": "bm25(job_fts, 0, 8, 6, 3, 4, 1)" if match else "j.created_at DESC",
         }.get(order, "j.created_at DESC, j.id")
         snippet = "snippet(job_fts, -1, char(2), char(3), '…', 14)" if match else "NULL"
@@ -1176,7 +1703,7 @@ class Repo:
         return int(row[0])
 
     def applications_by_source(
-        self, undo_minutes: int = 10
+        self, undo_minutes: int = 10, candidate_id: str | None = None
     ) -> list[tuple[str, str, str, str, bool, bool]]:
         """(platform, source name, job id, its status now, reached the next round, found there
         first) for every job you applied to, once per source that carried it, newest find first.
@@ -1184,6 +1711,56 @@ class Repo:
         Applied means Applied or any later status in your history; the next round means Interview
         or Offer. A status changed again within `undo_minutes` is taken as a misclick and ignored,
         so Interview undone 8 seconds later isn't an interview."""
+        if candidate_id:
+            query = text(
+                """
+                WITH h AS (
+                    SELECT job_id, status, changed_at,
+                           LEAD(changed_at) OVER (PARTITION BY job_id ORDER BY changed_at, id)
+                               AS next_at
+                    FROM candidate_application_history
+                    WHERE candidate_id = :cid
+                ),
+                kept AS (
+                    SELECT job_id, status FROM h
+                    WHERE next_at IS NULL
+                       OR (julianday(next_at) - julianday(changed_at)) * 1440 >= :undo
+                ),
+                outcome AS (
+                    SELECT job_id,
+                           MAX(status IN ('interview', 'interviewing', 'offer', 'offered'))
+                           AS next_round
+                    FROM kept
+                    WHERE status IN (
+                        'applied', 'interview', 'interviewing', 'offer', 'offered', 'rejected'
+                    )
+                    GROUP BY job_id
+                ),
+                per_source AS (  -- one row per job and source: a repost can't count twice
+                    SELECT m.source_id, o.job_id, o.next_round, MIN(m.received_at) AS seen
+                    FROM outcome o
+                    JOIN job_source js ON js.job_id = o.job_id
+                    JOIN raw_message m ON m.id = js.raw_message_id
+                    GROUP BY m.source_id, o.job_id
+                ),
+                first AS (SELECT job_id, MIN(seen) AS seen FROM per_source GROUP BY job_id)
+                SELECT s.platform, coalesce(s.title, s.chat_id), p.job_id,
+                       coalesce(ca.status, 'applied'), p.next_round,
+                       p.seen = f.seen
+                FROM per_source p
+                JOIN source s ON s.id = p.source_id
+                LEFT JOIN candidate_application ca
+                    ON ca.candidate_id = :cid AND ca.job_id = p.job_id
+                JOIN first f ON f.job_id = p.job_id
+                ORDER BY p.seen DESC
+                """
+            )
+            with self._tx() as c:
+                rows = c.execute(query, {"undo": undo_minutes, "cid": candidate_id}).all()
+            return [
+                (str(r[0]), str(r[1]), str(r[2]), str(r[3]), bool(r[4]), bool(r[5])) for r in rows
+            ]
+
         query = text(
             """
             WITH h AS (
@@ -1410,3 +1987,1133 @@ class Repo:
         counts = dict.fromkeys(TaskStatus, 0)
         counts.update({TaskStatus(r[0]): int(r[1]) for r in rows})
         return counts
+
+    # ---- candidate foundation ----------------------------------------------------------------
+
+    def create_candidate(
+        self,
+        id: str | None = None,
+        display_name: str | None = None,
+        email: str | None = None,
+        name: str | None = None,
+    ) -> Candidate:
+        cand_id = id or f"cand_{uuid.uuid4().hex[:12]}"
+        now = self._now()
+        cand = Candidate(
+            id=cand_id,
+            display_name=display_name or name,
+            email=email,
+            created_at=now,
+            updated_at=now,
+        )
+        with Session(self.engine) as s:
+            s.add(cand)
+            s.commit()
+            s.refresh(cand)
+            return cand
+
+    def get_candidate(self, candidate_id: str) -> Candidate | None:
+        with Session(self.engine) as s:
+            return s.get(Candidate, candidate_id)
+
+    def list_candidates(self) -> list[Candidate]:
+        with Session(self.engine) as s:
+            return list(s.exec(select(Candidate).order_by(col(Candidate.created_at).desc())).all())
+
+    def resolve_owner_candidate(
+        self,
+        configured_id: str | None = None,
+        owner_email: str | None = None,
+    ) -> Candidate:
+        """Resolve the workspace owner candidate identity safely.
+
+        Resolution rules:
+        1. An explicitly configured owner_candidate_id takes precedence.
+        2. If configured, the candidate must exist in the database; otherwise raise
+           OwnerResolutionError with an actionable message.
+        3. If owner_candidate_id is not configured, resolve ONLY through a reliable, established
+           legacy-owner identity (e.g. verified owner_email matching candidate.email).
+        4. A candidate being the only confirmed candidate must NOT automatically make that
+           candidate the legacy owner.
+        5. A candidate being the only candidate in the database must NOT automatically make that
+           candidate the legacy owner.
+        6. If identity is absent, ambiguous, or cannot be verified, fail safely with
+           OwnerResolutionError instructing the operator to configure owner_candidate_id in
+           config.yaml or via JOBRADAR_OWNER_CANDIDATE_ID.
+        7. Never create a new candidate, duplicate identity, transfer assessments,
+           or mutate records.
+        """
+        # 1 & 2: Explicit configured owner ID
+        if configured_id and configured_id.strip():
+            cand = self.get_candidate(configured_id.strip())
+            if cand is None:
+                raise OwnerResolutionError(
+                    f"Configured owner_candidate_id '{configured_id}' was not found in database. "
+                    "Verify the candidate ID in config.yaml or set JOBRADAR_OWNER_CANDIDATE_ID."
+                )
+            return cand
+
+        # 3, 4, 5 & 6: Unconfigured ID requires a reliable legacy-owner identity
+        if not owner_email or not owner_email.strip():
+            raise OwnerResolutionError(
+                "Legacy owner candidate identity cannot be verified: owner_candidate_id is not "
+                "configured and no verified owner email was provided. Please configure "
+                "'owner_candidate_id' in config.yaml or set JOBRADAR_OWNER_CANDIDATE_ID."
+            )
+
+        email_norm = owner_email.strip().lower()
+        candidates = self.list_candidates()
+        if not candidates:
+            raise OwnerResolutionError(
+                "No candidates found in the database. "
+                "Onboard a candidate first or set owner_candidate_id in config.yaml."
+            )
+
+        matched = [c for c in candidates if (c.email or "").strip().lower() == email_norm]
+
+        if not matched:
+            raise OwnerResolutionError(
+                f"Legacy owner identity could not be verified: no candidate found with email "
+                f"'{owner_email}'. Please configure 'owner_candidate_id' in config.yaml or set "
+                "JOBRADAR_OWNER_CANDIDATE_ID."
+            )
+
+        if len(matched) > 1:
+            ids = [c.id for c in matched]
+            raise OwnerResolutionError(
+                f"Ambiguous owner identity: multiple candidates found with email '{owner_email}' "
+                f"({ids}). Please explicitly configure 'owner_candidate_id' in config.yaml or set "
+                "JOBRADAR_OWNER_CANDIDATE_ID."
+            )
+
+        owner = matched[0]
+        profiles = self.get_candidate_profiles(owner.id)
+        if not any(p.review_status == "confirmed" for p in profiles):
+            raise OwnerResolutionError(
+                f"Candidate '{owner.id}' matches owner email '{owner_email}' but has no confirmed "
+                "profile. Confirm an owner profile or explicitly specify 'owner_candidate_id' in "
+                "config.yaml."
+            )
+
+        return owner
+
+    def resolve_owner_candidate_id(
+        self,
+        configured_id: str | None = None,
+        owner_email: str | None = None,
+    ) -> str:
+        """Convenience method returning the resolved owner candidate's ID."""
+        return self.resolve_owner_candidate(configured_id, owner_email).id
+
+    def resolve_owner_candidate_from_settings(
+        self,
+        settings: Settings,
+        profile: dict[str, Any] | None = None,
+    ) -> Candidate:
+        """Resolve workspace owner candidate safely using Settings and profile data.
+
+        Identity evaluation order:
+        1. Explicit AppConfig.owner_candidate_id takes precedence.
+        2. If unset, inspect the two configured identity sources:
+           - Secrets.notify_address (from .env / environment)
+           - config/profile.yaml -> basics.email
+        3. If both sources are present but disagree, do not silently choose one:
+           raise OwnerResolutionError requiring explicit owner_candidate_id.
+        4. If both agree, or only one is set, use that verified owner email.
+        5. If neither is set, fail safely with OwnerResolutionError.
+        """
+        configured_id = settings.config.owner_candidate_id
+        if configured_id and configured_id.strip():
+            return self.resolve_owner_candidate(configured_id=configured_id.strip())
+
+        notify_addr = (settings.secrets.notify_address or "").strip().lower() or None
+
+        profile_data = profile
+        if profile_data is None and settings.config.matching.profile_path.is_file():
+            try:
+                from jobradar.profile import load_profile
+
+                profile_data = load_profile(settings.config.matching.profile_path)
+            except Exception:
+                profile_data = None
+
+        basics = profile_data.get("basics") if isinstance(profile_data, dict) else None
+        profile_email = (
+            (basics.get("email") or "").strip().lower() if isinstance(basics, dict) else None
+        )
+
+        if notify_addr and profile_email and notify_addr != profile_email:
+            raise OwnerResolutionError(
+                "Configured owner identity sources disagree: secrets.notify_address "
+                f"('{notify_addr}') does not match profile.yaml basics.email "
+                f"('{profile_email}'). Please configure 'owner_candidate_id' in config.yaml "
+                "or set JOBRADAR_OWNER_CANDIDATE_ID."
+            )
+
+        owner_email = notify_addr or profile_email
+        if not owner_email:
+            raise OwnerResolutionError(
+                "Legacy owner candidate identity cannot be verified: owner_candidate_id is not "
+                "configured and no owner email was found in secrets or profile.yaml. "
+                "Please configure 'owner_candidate_id' in config.yaml or set "
+                "JOBRADAR_OWNER_CANDIDATE_ID."
+            )
+
+        return self.resolve_owner_candidate(configured_id=None, owner_email=owner_email)
+
+    def resolve_owner_candidate_id_from_settings(
+        self,
+        settings: Settings,
+        profile: dict[str, Any] | None = None,
+    ) -> str:
+        """Convenience method returning the resolved owner candidate's ID from Settings."""
+        return self.resolve_owner_candidate_from_settings(settings, profile).id
+
+    def save_resume(
+        self,
+        candidate_id: str,
+        original_filename: str | None = None,
+        stored_path: str = "",
+        file_type: str = "pdf",
+        file_size: int = 0,
+        extraction_status: str = "extracted",
+        extracted_text: str | None = None,
+        filename: str | None = None,
+        raw_text: str | None = None,
+        resume_id: str | None = None,
+    ) -> Resume:
+        r_id = resume_id or f"res_{uuid.uuid4().hex[:12]}"
+        now = self._now()
+        fname = original_filename or filename or "resume.pdf"
+        text = extracted_text or raw_text
+        fsize = file_size or len(text or "")
+        resume = Resume(
+            id=r_id,
+            candidate_id=candidate_id,
+            original_filename=fname,
+            stored_path=stored_path or f"storage/resumes/{r_id}.{file_type}",
+            file_type=file_type,
+            file_size=fsize,
+            extraction_status=extraction_status,
+            extracted_text=text,
+            created_at=now,
+        )
+        with Session(self.engine) as s:
+            s.add(resume)
+            s.commit()
+            s.refresh(resume)
+            return resume
+
+    def get_resume(self, resume_id: str) -> Resume | None:
+        with Session(self.engine) as s:
+            return s.get(Resume, resume_id)
+
+    def get_candidate_resumes(self, candidate_id: str) -> list[Resume]:
+        with Session(self.engine) as s:
+            stmt = (
+                select(Resume)
+                .where(Resume.candidate_id == candidate_id)
+                .order_by(col(Resume.created_at).desc())
+            )
+            return list(s.exec(stmt).all())
+
+    def save_profile_draft(
+        self,
+        candidate_id: str,
+        resume_id_or_data: Any = None,
+        profile_data: dict[str, Any] | None = None,
+        resume_id: str | None = None,
+        profile_id: str | None = None,
+    ) -> CandidateProfile:
+        if isinstance(resume_id_or_data, dict):
+            p_data = resume_id_or_data
+            r_id = resume_id
+        else:
+            r_id = resume_id or resume_id_or_data
+            p_data = profile_data or {}
+
+        p_id = profile_id or f"prof_{uuid.uuid4().hex[:12]}"
+        now = self._now()
+        with Session(self.engine) as s:
+            # Check latest version for this candidate
+            latest = s.exec(
+                select(CandidateProfile)
+                .where(CandidateProfile.candidate_id == candidate_id)
+                .order_by(col(CandidateProfile.version).desc())
+            ).first()
+            version = (
+                latest.version
+                if latest and latest.review_status == "draft"
+                else ((latest.version + 1) if latest else 1)
+            )
+
+            if latest and latest.review_status == "draft":
+                # Update existing draft
+                latest.profile_data_json = json.dumps(p_data)
+                latest.resume_id = r_id or latest.resume_id
+                latest.updated_at = now
+                s.add(latest)
+                s.commit()
+                s.refresh(latest)
+                return latest
+
+            profile = CandidateProfile(
+                id=p_id,
+                candidate_id=candidate_id,
+                resume_id=r_id,
+                version=version,
+                profile_data_json=json.dumps(p_data),
+                review_status="draft",
+                is_active=False,
+                created_at=now,
+                updated_at=now,
+            )
+            s.add(profile)
+            s.commit()
+            s.refresh(profile)
+            return profile
+
+    create_profile_draft = save_profile_draft
+
+    def confirm_profile(
+        self,
+        arg1: str,
+        arg2: Any = None,
+        arg3: dict[str, Any] | None = None,
+    ) -> CandidateProfile:
+        """Confirm a candidate profile.
+
+        Supports confirm_profile(profile_id, profile_data) and
+        confirm_profile(candidate_id, profile_id, profile_data).
+        """
+        if isinstance(arg2, dict) or arg2 is None:
+            profile_id = arg1
+            profile_data = arg2
+            candidate_id = None
+        else:
+            candidate_id = arg1
+            profile_id = str(arg2)
+            profile_data = arg3
+
+        now = self._now()
+        with Session(self.engine) as s:
+            profile = s.get(CandidateProfile, profile_id)
+            if profile is None or (candidate_id and profile.candidate_id != candidate_id):
+                raise ValueError("profile not found or unauthorized")
+
+            prev_profiles = s.exec(
+                select(CandidateProfile).where(
+                    CandidateProfile.candidate_id == profile.candidate_id,
+                    col(CandidateProfile.is_active).is_(True),
+                )
+            ).all()
+
+            # If it was already confirmed, create a new version!
+            if profile.review_status == "confirmed":
+                for p in prev_profiles:
+                    p.is_active = False
+                    s.add(p)
+
+                # Monotonically increasing candidate-scoped version to prevent collisions
+                max_ver = s.exec(
+                    select(col(CandidateProfile.version))
+                    .where(CandidateProfile.candidate_id == profile.candidate_id)
+                    .order_by(col(CandidateProfile.version).desc())
+                ).first()
+                new_version = (max_ver or profile.version) + 1
+                new_id = uuid.uuid4().hex
+                new_profile = CandidateProfile(
+                    id=new_id,
+                    candidate_id=profile.candidate_id,
+                    resume_id=profile.resume_id,
+                    version=new_version,
+                    profile_data_json=(
+                        json.dumps(profile_data)
+                        if profile_data is not None
+                        else profile.profile_data_json
+                    ),
+                    review_status="confirmed",
+                    is_active=True,
+                    confirmed_at=now,
+                    created_at=profile.created_at,
+                    updated_at=now,
+                )
+                s.add(new_profile)
+                cand = s.get(Candidate, profile.candidate_id)
+                if cand:
+                    cand.updated_at = now
+                    s.add(cand)
+                s.commit()
+                s.refresh(new_profile)
+                return new_profile
+
+            for p in prev_profiles:
+                if p.id != profile.id:
+                    p.is_active = False
+                    s.add(p)
+
+            if profile_data is not None:
+                profile.profile_data_json = json.dumps(profile_data)
+            profile.review_status = "confirmed"
+            profile.is_active = True
+            profile.confirmed_at = now
+            profile.updated_at = now
+            s.add(profile)
+
+            cand = s.get(Candidate, profile.candidate_id)
+            if cand:
+                cand.updated_at = now
+                s.add(cand)
+
+            s.commit()
+            s.refresh(profile)
+            return profile
+
+    def get_candidate_profiles(self, candidate_id: str) -> list[CandidateProfile]:
+        with Session(self.engine) as s:
+            stmt = (
+                select(CandidateProfile)
+                .where(CandidateProfile.candidate_id == candidate_id)
+                .order_by(col(CandidateProfile.version).desc())
+            )
+            return list(s.exec(stmt).all())
+
+    def get_active_profile(self, candidate_id: str) -> CandidateProfile | None:
+        with Session(self.engine) as s:
+            active = s.exec(
+                select(CandidateProfile)
+                .where(
+                    CandidateProfile.candidate_id == candidate_id,
+                    col(CandidateProfile.is_active).is_(True),
+                )
+                .order_by(col(CandidateProfile.version).desc())
+            ).first()
+            if active:
+                return active
+            return s.exec(
+                select(CandidateProfile)
+                .where(
+                    CandidateProfile.candidate_id == candidate_id,
+                    CandidateProfile.review_status == "confirmed",
+                )
+                .order_by(col(CandidateProfile.version).desc())
+            ).first()
+
+    def get_profile(self, profile_id: str) -> CandidateProfile | None:
+        with Session(self.engine) as s:
+            return s.get(CandidateProfile, profile_id)
+
+    # ---- candidate-specific matching assessments -----------------------------------------
+
+    def save_candidate_job_assessment(
+        self,
+        candidate_id: str,
+        job_id: str,
+        profile_id: str,
+        profile_version: int,
+        assessment: TrackAssessment,
+        eligibility: EligibilityResult,
+        missing_preferred_skills: list[str] | None = None,
+    ) -> CandidateJobAssessment:
+        """Upsert one candidate-specific track assessment with deterministic identity."""
+        now = self._now()
+        assessment_id = uuid.uuid4().hex
+        reasons = list(eligibility.blockers) + list(eligibility.unresolved)
+        pref_missing = missing_preferred_skills or []
+
+        with self._tx() as c:
+            c.execute(
+                text(
+                    """
+                    INSERT INTO candidate_job_assessment (
+                        id, candidate_id, job_id, profile_id, profile_version, track,
+                        technical_score, evidence_coverage, eligibility_status,
+                        eligibility_reasons_json, matched_skills_json,
+                        missing_required_skills_json, missing_preferred_skills_json,
+                        recommended_resume, explanation, assessment_json, eligibility_json,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, :candidate_id, :job_id, :profile_id, :profile_version, :track,
+                        :technical_score, :evidence_coverage, :eligibility_status,
+                        :eligibility_reasons_json, :matched_skills_json,
+                        :missing_required_skills_json, :missing_preferred_skills_json,
+                        :recommended_resume, :explanation, :assessment_json, :eligibility_json,
+                        :now, :now
+                    )
+                    ON CONFLICT (candidate_id, job_id, profile_version, track) DO UPDATE SET
+                        profile_id = excluded.profile_id,
+                        technical_score = excluded.technical_score,
+                        evidence_coverage = excluded.evidence_coverage,
+                        eligibility_status = excluded.eligibility_status,
+                        eligibility_reasons_json = excluded.eligibility_reasons_json,
+                        matched_skills_json = excluded.matched_skills_json,
+                        missing_required_skills_json = excluded.missing_required_skills_json,
+                        missing_preferred_skills_json = excluded.missing_preferred_skills_json,
+                        recommended_resume = excluded.recommended_resume,
+                        explanation = excluded.explanation,
+                        assessment_json = excluded.assessment_json,
+                        eligibility_json = excluded.eligibility_json,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                {
+                    "id": assessment_id,
+                    "candidate_id": candidate_id,
+                    "job_id": job_id,
+                    "profile_id": profile_id,
+                    "profile_version": profile_version,
+                    "track": assessment.track,
+                    "technical_score": assessment.score,
+                    "evidence_coverage": assessment.evidence_coverage,
+                    "eligibility_status": eligibility.state.value,
+                    "eligibility_reasons_json": json.dumps(reasons),
+                    "matched_skills_json": json.dumps(assessment.matched_skills),
+                    "missing_required_skills_json": json.dumps(assessment.missing_required_skills),
+                    "missing_preferred_skills_json": json.dumps(pref_missing),
+                    "recommended_resume": assessment.recommended_resume,
+                    "explanation": assessment.explanation,
+                    "assessment_json": assessment.model_dump_json(),
+                    "eligibility_json": eligibility.model_dump_json(),
+                    "now": now,
+                },
+            )
+
+        with Session(self.engine) as s:
+            return s.exec(
+                select(CandidateJobAssessment).where(
+                    CandidateJobAssessment.candidate_id == candidate_id,
+                    CandidateJobAssessment.job_id == job_id,
+                    CandidateJobAssessment.profile_version == profile_version,
+                    CandidateJobAssessment.track == assessment.track,
+                )
+            ).one()
+
+    def save_candidate_four_track_assessment(
+        self,
+        candidate_id: str,
+        job_id: str,
+        profile_id: str,
+        profile_version: int,
+        result: FourTrackAssessment,
+    ) -> list[CandidateJobAssessment]:
+        """Save assessments for all tracks in a single atomic transaction."""
+        now = self._now()
+        reasons = list(result.eligibility.blockers) + list(result.eligibility.unresolved)
+        assessments = list(result.tracks.values())
+
+        with self._tx() as c:
+            for assessment in assessments:
+                assessment_id = uuid.uuid4().hex
+                c.execute(
+                    text(
+                        """
+                        INSERT INTO candidate_job_assessment (
+                            id, candidate_id, job_id, profile_id, profile_version, track,
+                            technical_score, evidence_coverage, eligibility_status,
+                            eligibility_reasons_json, matched_skills_json,
+                            missing_required_skills_json, missing_preferred_skills_json,
+                            recommended_resume, explanation, assessment_json, eligibility_json,
+                            created_at, updated_at
+                        ) VALUES (
+                            :id, :candidate_id, :job_id, :profile_id, :profile_version, :track,
+                            :technical_score, :evidence_coverage, :eligibility_status,
+                            :eligibility_reasons_json, :matched_skills_json,
+                            :missing_required_skills_json, :missing_preferred_skills_json,
+                            :recommended_resume, :explanation, :assessment_json, :eligibility_json,
+                            :now, :now
+                        )
+                        ON CONFLICT (candidate_id, job_id, profile_version, track) DO UPDATE SET
+                            profile_id = excluded.profile_id,
+                            technical_score = excluded.technical_score,
+                            evidence_coverage = excluded.evidence_coverage,
+                            eligibility_status = excluded.eligibility_status,
+                            eligibility_reasons_json = excluded.eligibility_reasons_json,
+                            matched_skills_json = excluded.matched_skills_json,
+                            missing_required_skills_json = excluded.missing_required_skills_json,
+                            missing_preferred_skills_json = excluded.missing_preferred_skills_json,
+                            recommended_resume = excluded.recommended_resume,
+                            explanation = excluded.explanation,
+                            assessment_json = excluded.assessment_json,
+                            eligibility_json = excluded.eligibility_json,
+                            updated_at = excluded.updated_at
+                        """
+                    ),
+                    {
+                        "id": assessment_id,
+                        "candidate_id": candidate_id,
+                        "job_id": job_id,
+                        "profile_id": profile_id,
+                        "profile_version": profile_version,
+                        "track": assessment.track,
+                        "technical_score": assessment.score,
+                        "evidence_coverage": assessment.evidence_coverage,
+                        "eligibility_status": result.eligibility.state.value,
+                        "eligibility_reasons_json": json.dumps(reasons),
+                        "matched_skills_json": json.dumps(assessment.matched_skills),
+                        "missing_required_skills_json": json.dumps(
+                            assessment.missing_required_skills
+                        ),
+                        "missing_preferred_skills_json": json.dumps([]),
+                        "recommended_resume": assessment.recommended_resume,
+                        "explanation": assessment.explanation,
+                        "assessment_json": assessment.model_dump_json(),
+                        "eligibility_json": result.eligibility.model_dump_json(),
+                        "now": now,
+                    },
+                )
+
+        with Session(self.engine) as s:
+            stmt = (
+                select(CandidateJobAssessment)
+                .where(
+                    CandidateJobAssessment.candidate_id == candidate_id,
+                    CandidateJobAssessment.job_id == job_id,
+                    CandidateJobAssessment.profile_version == profile_version,
+                )
+                .order_by(col(CandidateJobAssessment.track))
+            )
+            return list(s.exec(stmt).all())
+
+    def get_candidate_job_assessment(
+        self,
+        candidate_id: str,
+        job_id: str,
+        profile_version: int,
+        track: str,
+    ) -> CandidateJobAssessment | None:
+        """Retrieve a specific candidate track assessment."""
+        with Session(self.engine) as s:
+            stmt = select(CandidateJobAssessment).where(
+                CandidateJobAssessment.candidate_id == candidate_id,
+                CandidateJobAssessment.job_id == job_id,
+                CandidateJobAssessment.profile_version == profile_version,
+                CandidateJobAssessment.track == track,
+            )
+            return s.exec(stmt).first()
+
+    def list_candidate_assessments(
+        self,
+        candidate_id: str,
+        job_id: str | None = None,
+        profile_version: int | None = None,
+        track: str | None = None,
+        job_ids: Sequence[str] | None = None,
+    ) -> list[CandidateJobAssessment]:
+        """Query candidate assessments filtered by job, version, and/or track."""
+        with Session(self.engine) as s:
+            stmt = select(CandidateJobAssessment).where(
+                CandidateJobAssessment.candidate_id == candidate_id
+            )
+            if job_id is not None:
+                stmt = stmt.where(CandidateJobAssessment.job_id == job_id)
+            if job_ids is not None:
+                stmt = stmt.where(col(CandidateJobAssessment.job_id).in_(list(job_ids)))
+            if profile_version is not None:
+                stmt = stmt.where(CandidateJobAssessment.profile_version == profile_version)
+            if track is not None:
+                stmt = stmt.where(CandidateJobAssessment.track == track)
+            stmt = stmt.order_by(
+                col(CandidateJobAssessment.job_id),
+                col(CandidateJobAssessment.profile_version).desc(),
+                col(CandidateJobAssessment.track),
+            )
+            return list(s.exec(stmt).all())
+
+    # ---- candidate historical legacy assessments -----------------------------------------
+
+    def save_historical_assessment(
+        self,
+        candidate_id: str,
+        job_id: str,
+        score: int,
+        score_reason: str = "",
+        scoring_system: str = "legacy_matcher",
+        scored_at: str | None = None,
+    ) -> CandidateHistoricalAssessment:
+        """Preserve historical legacy Matcher score and reasoning for a candidate."""
+        now = self._now()
+        hist_id = uuid.uuid4().hex
+        with self._tx() as c:
+            c.execute(
+                text(
+                    """
+                    INSERT INTO candidate_historical_assessment (
+                        id, candidate_id, job_id, score, score_reason,
+                        scoring_system, scored_at, created_at, updated_at
+                    ) VALUES (
+                        :id, :cand_id, :job_id, :score, :score_reason,
+                        :scoring_system, :scored_at, :now, :now
+                    )
+                    ON CONFLICT (candidate_id, job_id) DO UPDATE SET
+                        score = excluded.score,
+                        score_reason = excluded.score_reason,
+                        scoring_system = excluded.scoring_system,
+                        scored_at = coalesce(
+                            excluded.scored_at,
+                            candidate_historical_assessment.scored_at
+                        ),
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                {
+                    "id": hist_id,
+                    "cand_id": candidate_id,
+                    "job_id": job_id,
+                    "score": score,
+                    "score_reason": score_reason,
+                    "scoring_system": scoring_system,
+                    "scored_at": scored_at,
+                    "now": now,
+                },
+            )
+        assessment = self.get_historical_assessment(candidate_id, job_id)
+        if assessment is None:
+            raise RuntimeError(
+                f"failed to retrieve saved historical assessment for {candidate_id}:{job_id}"
+            )
+        return assessment
+
+    def get_historical_assessment(
+        self, candidate_id: str, job_id: str
+    ) -> CandidateHistoricalAssessment | None:
+        """Fetch a preserved historical legacy assessment for a candidate and job."""
+        with Session(self.engine) as s:
+            return s.exec(
+                select(CandidateHistoricalAssessment).where(
+                    CandidateHistoricalAssessment.candidate_id == candidate_id,
+                    CandidateHistoricalAssessment.job_id == job_id,
+                )
+            ).first()
+
+    def list_historical_assessments(self, candidate_id: str) -> list[CandidateHistoricalAssessment]:
+        """Fetch all historical legacy assessments for a candidate."""
+        with Session(self.engine) as s:
+            return list(
+                s.exec(
+                    select(CandidateHistoricalAssessment)
+                    .where(CandidateHistoricalAssessment.candidate_id == candidate_id)
+                    .order_by(col(CandidateHistoricalAssessment.score).desc())
+                ).all()
+            )
+
+    # ---- candidate applications & tracking ------------------------------------------------
+
+    def save_candidate_application(
+        self,
+        candidate_id: str,
+        job_id: str,
+        status: str,
+        notes: str = "",
+        applied_at: str | None = None,
+    ) -> CandidateApplication:
+        """Save or update candidate-specific application state for a job."""
+        allowed_statuses = {s.value for s in CandidateApplicationStatus}
+        if status not in allowed_statuses:
+            allowed_msg = sorted(allowed_statuses)
+            raise ValueError(
+                f"Invalid candidate application status '{status}'. Must be one of: {allowed_msg}"
+            )
+
+        now = self._now()
+        if status == "applied" and not applied_at:
+            applied_at = now
+
+        app_id = uuid.uuid4().hex
+        with self._tx() as c:
+            c.execute(
+                text(
+                    """
+                    INSERT INTO candidate_application (
+                        id, candidate_id, job_id, status, applied_at, notes, created_at, updated_at
+                    ) VALUES (
+                        :id, :cand_id, :job_id, :status, :applied_at, :notes, :now, :now
+                    )
+                    ON CONFLICT (candidate_id, job_id) DO UPDATE SET
+                        status = excluded.status,
+                        applied_at = coalesce(
+                            excluded.applied_at, candidate_application.applied_at
+                        ),
+                        notes = excluded.notes,
+                        updated_at = excluded.updated_at
+                    """
+                ),
+                {
+                    "id": app_id,
+                    "cand_id": candidate_id,
+                    "job_id": job_id,
+                    "status": status,
+                    "applied_at": applied_at,
+                    "notes": notes,
+                    "now": now,
+                },
+            )
+
+            c.execute(
+                text(
+                    """
+                    INSERT INTO candidate_application_history (
+                        candidate_id, job_id, status, notes, changed_at
+                    ) VALUES (
+                        :cand_id, :job_id, :status, :notes, :now
+                    )
+                    """
+                ),
+                {
+                    "cand_id": candidate_id,
+                    "job_id": job_id,
+                    "status": status,
+                    "notes": notes,
+                    "now": now,
+                },
+            )
+
+        app = self.get_candidate_application(candidate_id, job_id)
+        if app is None:
+            raise RuntimeError(f"Failed to retrieve saved application for {candidate_id}:{job_id}")
+        return app
+
+    def get_candidate_application(
+        self, candidate_id: str, job_id: str
+    ) -> CandidateApplication | None:
+        """Retrieve candidate's application record for a specific job."""
+        with Session(self.engine) as s:
+            stmt = select(CandidateApplication).where(
+                CandidateApplication.candidate_id == candidate_id,
+                CandidateApplication.job_id == job_id,
+            )
+            return s.exec(stmt).first()
+
+    def list_candidate_applications(
+        self,
+        candidate_id: str,
+        status: str | None = None,
+        job_ids: Sequence[str] | None = None,
+    ) -> list[CandidateApplication]:
+        """List all application records for a candidate, optionally filtered by status."""
+        with Session(self.engine) as s:
+            stmt = select(CandidateApplication).where(
+                CandidateApplication.candidate_id == candidate_id
+            )
+            if status is not None:
+                stmt = stmt.where(CandidateApplication.status == status)
+            if job_ids is not None:
+                stmt = stmt.where(col(CandidateApplication.job_id).in_(list(job_ids)))
+            stmt = stmt.order_by(col(CandidateApplication.updated_at).desc())
+            return list(s.exec(stmt).all())
+
+    def get_candidate_application_counts(self, candidate_id: str) -> dict[str, int]:
+        """Summary counts of candidate applications by status."""
+        counts = {
+            "saved": 0,
+            "applied": 0,
+            "interviewing": 0,
+            "offered": 0,
+            "rejected": 0,
+            "skipped": 0,
+            "total": 0,
+        }
+        with self._tx() as c:
+            rows = c.execute(
+                text(
+                    """
+                    SELECT status, count(*)
+                    FROM candidate_application
+                    WHERE candidate_id = :cand_id
+                    GROUP BY status
+                    """
+                ),
+                {"cand_id": candidate_id},
+            ).fetchall()
+            for st, cnt in rows:
+                st_str = str(st)
+                if st_str in counts:
+                    counts[st_str] = int(cnt)
+                    counts["total"] += int(cnt)
+        return counts
+
+    def list_candidate_application_history(
+        self, candidate_id: str, job_id: str | None = None
+    ) -> list[CandidateApplicationHistory]:
+        """List status audit log entries for a candidate's applications."""
+        with Session(self.engine) as s:
+            stmt = select(CandidateApplicationHistory).where(
+                CandidateApplicationHistory.candidate_id == candidate_id
+            )
+            if job_id is not None:
+                stmt = stmt.where(CandidateApplicationHistory.job_id == job_id)
+            stmt = stmt.order_by(col(CandidateApplicationHistory.id).desc())
+            return list(s.exec(stmt).all())
+
+    def get_candidate_assessment_stats(
+        self, candidate_id: str, profile_version: int, track: str | None = None
+    ) -> dict[str, int]:
+        """Summary statistics of candidate assessments for a profile version."""
+        stats = {
+            "total": 0,
+            "eligible": 0,
+            "likely_eligible": 0,
+            "needs_verification": 0,
+            "not_eligible": 0,
+        }
+        with self._tx() as c:
+            sql = """
+                SELECT eligibility_status, count(DISTINCT job_id)
+                FROM candidate_job_assessment
+                WHERE candidate_id = :cand_id AND profile_version = :version
+            """
+            params: dict[str, Any] = {"cand_id": candidate_id, "version": profile_version}
+            if track:
+                sql += " AND track = :track"
+                params["track"] = track
+            sql += " GROUP BY eligibility_status"
+            rows = c.execute(text(sql), params).fetchall()
+            for st, cnt in rows:
+                cnt_int = int(cnt)
+                st_lower = str(st).lower()
+                if st_lower in stats:
+                    stats[st_lower] = cnt_int
+                stats["total"] += cnt_int
+        return stats
+
+    def get_candidate_recommendations(
+        self,
+        candidate_id: str,
+        profile_version: int,
+        track: str | None = None,
+        eligibility: str | None = None,
+        min_score: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retrieve personalized job recommendations for a candidate.
+
+        Joins CandidateJobAssessment with Job details and CandidateApplication status.
+        Sorts eligible first, then by technical fit score descending.
+        """
+        with Session(self.engine) as s:
+            stmt = select(CandidateJobAssessment).where(
+                CandidateJobAssessment.candidate_id == candidate_id,
+                CandidateJobAssessment.profile_version == profile_version,
+            )
+            if track:
+                stmt = stmt.where(CandidateJobAssessment.track == track)
+            if eligibility:
+                elig_lower = eligibility.lower()
+                if elig_lower == "eligible":
+                    stmt = stmt.where(
+                        col(CandidateJobAssessment.eligibility_status).in_(
+                            ["ELIGIBLE", "LIKELY_ELIGIBLE"]
+                        )
+                    )
+                elif elig_lower == "all":
+                    pass  # Explicitly include all statuses including NOT_ELIGIBLE
+                else:
+                    stmt = stmt.where(
+                        CandidateJobAssessment.eligibility_status == eligibility.upper()
+                    )
+            else:
+                # Default recommendation feed: keep confirmed NOT_ELIGIBLE separate
+                stmt = stmt.where(col(CandidateJobAssessment.eligibility_status) != "NOT_ELIGIBLE")
+            if min_score is not None:
+                stmt = stmt.where(col(CandidateJobAssessment.technical_score) >= min_score)
+
+            assessments = list(s.exec(stmt).all())
+
+        if not assessments:
+            return []
+
+        # If no specific track requested, pick the highest scoring track per job
+        if not track:
+            best_by_job: dict[str, CandidateJobAssessment] = {}
+            for a in assessments:
+                current_best = best_by_job.get(a.job_id)
+                if current_best is None:
+                    best_by_job[a.job_id] = a
+                else:
+                    a_score = a.technical_score if a.technical_score is not None else -1
+                    c_score = (
+                        current_best.technical_score
+                        if current_best.technical_score is not None
+                        else -1
+                    )
+                    if a_score > c_score:
+                        best_by_job[a.job_id] = a
+            assessments = list(best_by_job.values())
+
+        job_ids = [a.job_id for a in assessments]
+        with Session(self.engine) as s:
+            app_stmt = select(CandidateApplication).where(
+                CandidateApplication.candidate_id == candidate_id,
+                col(CandidateApplication.job_id).in_(job_ids),
+            )
+            apps = {app.job_id: app for app in s.exec(app_stmt).all()}
+
+            job_stmt = select(Job).where(
+                col(Job.id).in_(job_ids),
+                col(Job.status).notin_([JobStatus.HIDDEN.value, JobStatus.DISCARDED.value]),
+            )
+            jobs = {j.id: j for j in s.exec(job_stmt).all()}
+
+        results: list[dict[str, Any]] = []
+        for a in assessments:
+            job = jobs.get(a.job_id)
+            if job is None or job.status in (JobStatus.HIDDEN.value, JobStatus.DISCARDED.value):
+                continue
+            app = apps.get(a.job_id)
+            job_data: dict[str, Any] = {}
+            if job and job.data_json:
+                try:
+                    job_data = json.loads(job.data_json)
+                except Exception:
+                    job_data = {}
+
+            title = (
+                job_data.get("role")
+                or job_data.get("title")
+                or (job.role if job else "")
+                or "Software Engineer"
+            )
+            company = job_data.get("company") or (job.company if job else "") or "Company"
+            location = job_data.get("location") or "India / Remote"
+            apply_url = job_data.get("apply_url") or (job.canonical_url if job else "") or "#"
+
+            results.append(
+                {
+                    "assessment": a,
+                    "job_id": a.job_id,
+                    "title": title,
+                    "company": company,
+                    "location": location,
+                    "apply_url": apply_url,
+                    "track": a.track,
+                    "technical_score": a.technical_score,
+                    "evidence_coverage": a.evidence_coverage,
+                    "eligibility_status": a.eligibility_status,
+                    "eligibility_reasons": a.eligibility_reasons,
+                    "matched_skills": a.matched_skills,
+                    "missing_required_skills": a.missing_required_skills,
+                    "missing_preferred_skills": a.missing_preferred_skills,
+                    "recommended_resume": a.recommended_resume,
+                    "explanation": a.explanation,
+                    "application_status": app.status if app else None,
+                    "applied_at": app.applied_at if app else None,
+                    "application_notes": app.notes if app else "",
+                    "created_at": a.created_at,
+                }
+            )
+
+        eligibility_order = {
+            "ELIGIBLE": 1,
+            "LIKELY_ELIGIBLE": 2,
+            "NEEDS_VERIFICATION": 3,
+            "NOT_ELIGIBLE": 4,
+        }
+
+        results.sort(
+            key=lambda r: (
+                eligibility_order.get(r["eligibility_status"], 99),
+                -(r["technical_score"] if r["technical_score"] is not None else -1),
+                r["company"].lower(),
+            )
+        )
+
+        return results[:limit]
+
+    def get_job_with_candidate_context(
+        self, job_id: str, candidate_id: str
+    ) -> dict[str, Any] | None:
+        """Retrieve shared job record alongside candidate-isolated assessment and application state.
+
+        Ensures shared Job data is loaded separately from candidate-scoped records.
+        Does not mutate or contaminate shared Job records.
+        """
+        job = self.get_job(job_id)
+        if job is None:
+            return None
+
+        app = self.get_candidate_application(candidate_id, job_id)
+        assessments = self.list_candidate_assessments(candidate_id, job_id=job_id)
+        historical = self.get_historical_assessment(candidate_id, job_id)
+        resumes = self.get_candidate_resumes(candidate_id)
+
+        return {
+            "job": job,
+            "application": app,
+            "assessments": assessments,
+            "historical_assessment": historical,
+            "has_resume": bool(resumes),
+        }
+
+    def list_candidate_applications_with_jobs(
+        self, candidate_id: str, statuses: list[str] | None = None
+    ) -> list[tuple[CandidateApplication, Job]]:
+        """Retrieve candidate's applications paired with shared Job records.
+
+        Loads candidate application workflow state independently of shared Job.status.
+        """
+        with Session(self.engine) as s:
+            stmt = select(CandidateApplication).where(
+                CandidateApplication.candidate_id == candidate_id
+            )
+            if statuses:
+                stmt = stmt.where(col(CandidateApplication.status).in_(statuses))
+            stmt = stmt.order_by(col(CandidateApplication.updated_at).desc())
+            applications = list(s.exec(stmt).all())
+
+        if not applications:
+            return []
+
+        job_ids = [a.job_id for a in applications]
+        with Session(self.engine) as s:
+            job_stmt = select(Job).where(col(Job.id).in_(job_ids))
+            jobs_by_id = {j.id: j for j in s.exec(job_stmt).all()}
+
+        return [(a, jobs_by_id[a.job_id]) for a in applications if a.job_id in jobs_by_id]
+
+    def apply_candidate_action(
+        self,
+        candidate_id: str,
+        job_id: str,
+        action: str,
+        notes: str = "",
+        applied_at: str | None = None,
+    ) -> CandidateApplication:
+        """Apply a candidate workflow transition strictly within CandidateApplication.
+
+        Translates user action strings into valid CandidateApplicationStatus values.
+        Never mutates shared Job.status or Job.user_status_at.
+        """
+        action_map = {
+            "save": CandidateApplicationStatus.SAVED.value,
+            "saved": CandidateApplicationStatus.SAVED.value,
+            "shortlist": CandidateApplicationStatus.SAVED.value,
+            "shortlisted": CandidateApplicationStatus.SAVED.value,
+            "resume_ready": CandidateApplicationStatus.SAVED.value,
+            "apply": CandidateApplicationStatus.APPLIED.value,
+            "applied": CandidateApplicationStatus.APPLIED.value,
+            "interview": CandidateApplicationStatus.INTERVIEWING.value,
+            "interviewing": CandidateApplicationStatus.INTERVIEWING.value,
+            "offer": CandidateApplicationStatus.OFFERED.value,
+            "offered": CandidateApplicationStatus.OFFERED.value,
+            "reject": CandidateApplicationStatus.REJECTED.value,
+            "rejected": CandidateApplicationStatus.REJECTED.value,
+            "skip": CandidateApplicationStatus.SKIPPED.value,
+            "skipped": CandidateApplicationStatus.SKIPPED.value,
+        }
+        normalized = action.strip().lower()
+        target_status = action_map.get(normalized)
+        if not target_status:
+            raise ValueError(
+                f"Unknown candidate action '{action}'. Must map to one of: "
+                f"{sorted(set(action_map.values()))}"
+            )
+
+        if normalized == "resume_ready" and "resume_ready" not in notes:
+            notes = f"Migrated from legacy resume_ready state. {notes}".strip()
+
+        return self.save_candidate_application(
+            candidate_id=candidate_id,
+            job_id=job_id,
+            status=target_status,
+            notes=notes,
+            applied_at=applied_at,
+        )

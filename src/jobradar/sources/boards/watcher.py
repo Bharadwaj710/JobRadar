@@ -75,10 +75,20 @@ def post_text(board: BoardRef, posting: BoardPosting) -> str:
     return "\n".join(line for line in lines if line)
 
 
-def latest(postings: list[BoardPosting], seen_at: datetime) -> str:
+def latest(
+    postings: list[BoardPosting],
+    seen_at: datetime,
+    *,
+    candidate_independent: bool = False,
+) -> str:
     """The newest of these postings, with what the filters made of it, for `jobradar boards`."""
     newest = max(postings, key=lambda p: p.posted_at.timestamp() if p.posted_at else 0.0)
-    why = why_skipped(newest.title, newest.location, newest.level)
+    why = why_skipped(
+        newest.title,
+        newest.location,
+        newest.level,
+        candidate_independent=candidate_independent,
+    )
     return json.dumps({
         "title": newest.title, "where": newest.location,
         "verdict": "passed" if why is None else why, "seen": to_iso(seen_at),
@@ -195,8 +205,14 @@ class BoardWatcher:
             if ref.ats in DATED_BOARDS:
                 fresh = [p for p in fresh if p.posted_at and p.posted_at >= now - NEW_WITHIN]
             passed = []
+            cand_ind = getattr(self.config, "candidate_independent", False)
             for posting in fresh:
-                why = why_skipped(posting.title, posting.location, posting.level)
+                why = why_skipped(
+                    posting.title,
+                    posting.location,
+                    posting.level,
+                    candidate_independent=cand_ind,
+                )
                 about = {"board": ref.key, "title": posting.title[:80],
                          "where": posting.location[:60]}  # fmt: skip
                 if why is None:
@@ -205,11 +221,13 @@ class BoardWatcher:
                 else:
                     log.info("board posting skipped", extra=about | {"why": why})
             if fresh:
-                board.latest_json = latest(fresh, now)
-            if len(passed) > MAX_NEW_PER_CHECK:
-                log.warning("board passed on too many at once; keeping the first 10",
+                board.latest_json = latest(fresh, now, candidate_independent=cand_ind)
+            max_new = getattr(self.config, "max_new_per_check", MAX_NEW_PER_CHECK)
+            if len(passed) > max_new:
+                log.warning("board passed on too many at once; keeping the first %d",
+                            max_new,
                             extra={"board": ref.key, "new": len(passed)})  # fmt: skip
-                passed = passed[:MAX_NEW_PER_CHECK]
+                passed = passed[:max_new]
             for posting in passed:
                 await self.emit(
                     IncomingMessage(
@@ -242,12 +260,12 @@ class BoardWatcher:
         self.repo.save_board(board)
 
     async def _close(self, url: str) -> bool:
-        """Hide the job for a posting that left its board, if you haven't touched it."""
+        """Hide the job for a posting that left its board."""
         canonical = await canonicalise(url)
         if not canonical:
             return False
         job = self.repo.get_job(job_id_for_url(canonical))
-        if job is None or job.user_status_at is not None:
+        if job is None:
             return False
         if job.status not in (JobStatus.DISCOVERED, JobStatus.EXTRACTED, JobStatus.NEW):
             return False

@@ -26,6 +26,7 @@ from jobradar.pipeline.extract import PAGE_TEXT_LIMIT, own_post
 from jobradar.pipeline.liveness import Liveness, LivenessChecker
 from jobradar.pipeline.schemas import JobPosting
 from jobradar.pipeline.task_types import BUILD_RESUME, MATCH, NOTION_BODY, NOTION_UPSERT
+from jobradar.pipeline.technical_match import assess_job
 from jobradar.providers.base import JobView, MatchAnswers, MatchProvider, ProviderUnavailable
 from jobradar.providers.skills_rule import compare_skills
 from jobradar.queue.tasks import TaskQueue
@@ -132,6 +133,9 @@ class Matcher:
         clock: Clock = utcnow,
         liveness: LivenessChecker | None = None,
         build_resumes: bool = False,
+        track_profile: dict[str, Any] | None = None,
+        track_version: str | None = None,
+        candidate_independent: bool = False,
     ) -> None:
         self.repo = repo
         self.queue = queue
@@ -148,6 +152,11 @@ class Matcher:
         self.clock = clock
         self.liveness = liveness  # None: don't ask hiring sites whether postings are open
         self.build_resumes = build_resumes  # queue a resume for strong first matches
+        self.track_profile = track_profile
+        self.track_version = track_version or (version if track_profile is not None else None)
+        self.candidate_independent = candidate_independent or getattr(
+            matching, "candidate_independent", False
+        )
 
     async def match(self, task: TaskRecord) -> None:
         job = self.repo.get_job(task.key)
@@ -159,6 +168,11 @@ class Matcher:
         first = not self.repo.ever_matched(job.id)
         if first and await self._closed(job, posting):
             return
+        if task.payload.get("tracks", True) is not False:
+            self._persist_track_matches(job.id, posting)
+            self._persist_candidate_matches(job.id, posting)
+        if task.payload.get("legacy", True) is False:
+            return
         answers = hard_rules(posting, self.filters) or await self._ask(job.id, posting)
         if answers is None:
             log.info("no match provider could answer", extra={"job_id": job.id[:10]})
@@ -167,10 +181,40 @@ class Matcher:
         self.repo.save_match(job.id, self.version, answers.provider, answers.model_dump_json())
         self._apply(job.id, posting, answers, alert_ok=first)
 
+    def _persist_track_matches(self, job_id: str, posting: JobPosting) -> None:
+        if self.track_profile is None or self.track_version is None:
+            return
+        now = self.clock()
+        as_of = now.astimezone(self.tz).date() if self.tz else now.date()
+        result = assess_job(posting, self.track_profile, as_of)
+        self.repo.save_track_assessments(job_id, self.track_version, result)
+        for track, assessment in result.tracks.items():
+            if assessment.unscored_reason and assessment.unscored_reason.startswith(
+                "track assessment failed safely"
+            ):
+                log.warning(
+                    "track assessment failed safely",
+                    extra={"job_id": job_id[:10], "track": track},
+                )
+
+    def _persist_candidate_matches(self, job_id: str, posting: JobPosting) -> None:
+        try:
+            from jobradar.services.matching_service import CandidateMatchingService
+
+            service = CandidateMatchingService(self.repo)
+            for cand in self.repo.list_candidates():
+                active_p = self.repo.get_active_profile(cand.id)
+                if active_p and active_p.review_status == "confirmed":
+                    service.assess_candidate_job(
+                        cand.id, (job_id, posting), profile_version=active_p.version
+                    )
+        except Exception as e:
+            log.debug("Candidate evaluation in background match failed safely: %s", e)
+
     async def _closed(self, job: Job, posting: JobPosting) -> bool:
         """Ask the hiring site whether the posting is still open (Greenhouse, Lever, Ashby,
         SmartRecruiters links only). A closed one is hidden before any provider call."""
-        if self.liveness is None or job.user_status_at is not None:
+        if self.liveness is None or job.status not in _OPEN:
             return False
         sightings = self.repo.job_sightings(job.id)
         if any(s.platform == "board" and not s.chat_id.startswith("freehire:") for s in sightings):
@@ -238,14 +282,25 @@ class Matcher:
             decision = Decision("unsure")
         if not posting.is_job:  # an ad, course or event that got through extraction
             decision = Decision("not_a_job", hide_because="not a job posting (ad or event)")
-        if job.user_status_at is not None:
+        if not self.candidate_independent and job.user_status_at is not None:
             # You set this job's Status in Notion: keep the score fresh, decide nothing.
             decision = Decision("yours")
         if decision.hide_because:
-            self.repo.set_job_status(job_id, JobStatus.HIDDEN, decision.hide_because)
-            log.info("job hidden", extra={"job_id": job_id[:10], "why": decision.hide_because})
-            self.queue.enqueue(NOTION_UPSERT, job_id)
-            return True
+            is_source_safeguard = (
+                not posting.is_job
+                or decision.rule in ("not_a_job", "ad")
+                or "closed" in decision.hide_because
+            )
+            if is_source_safeguard or not self.candidate_independent:
+                self.repo.set_job_status(job_id, JobStatus.HIDDEN, decision.hide_because)
+                log.info("job hidden", extra={"job_id": job_id[:10], "why": decision.hide_because})
+                self.queue.enqueue(NOTION_UPSERT, job_id)
+                return True
+            else:
+                log.info(
+                    "job preserved in shared inventory (candidate-independent mode)",
+                    extra={"job_id": job_id[:10], "why": decision.hide_because},
+                )
         if changed:
             log.info(
                 "job matched",
@@ -295,7 +350,18 @@ class Matcher:
             posting = JobPosting.model_validate_json(job.data_json)
             answers = MatchAnswers.model_validate_json(answers_json)
             changed += self._apply(job_id, posting, answers, alert_ok=False)
-        queued = self.repo.jobs_to_match(self.version)
+        legacy = self.repo.jobs_to_match(self.version)
+        tracks = (
+            self.repo.jobs_to_track_match(self.track_version)
+            if self.track_profile is not None and self.track_version is not None
+            else []
+        )
+        legacy_set, track_set = set(legacy), set(tracks)
+        queued = list(dict.fromkeys([*legacy, *tracks]))
         for job_id in queued:
-            self.queue.enqueue(MATCH, job_id)
+            self.queue.enqueue(
+                MATCH,
+                job_id,
+                {"legacy": job_id in legacy_set, "tracks": job_id in track_set},
+            )
         return changed, len(queued)

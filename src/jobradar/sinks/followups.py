@@ -33,6 +33,7 @@ from jobradar.pipeline.task_types import FOLLOWUP_CHECK
 from jobradar.profile import load_profile
 from jobradar.providers.skills_rule import compare_skills
 from jobradar.queue.tasks import TaskQueue
+from jobradar.sinks.candidate_context import resolve_sink_candidate
 from jobradar.sinks.email_actions import REPLIED, Actions, mailto, recruiter_email
 from jobradar.sinks.email_notify import PREVIEW_DIR, notion_url, save_preview, smtp_send
 from jobradar.sinks.email_template import (
@@ -120,6 +121,7 @@ class FollowUpReminder:
         settings: Settings,
         repo: Repo,
         queue: TaskQueue,
+        candidate_id: str | None = None,
         clock: Clock = utcnow,
         preview_dir: Path = PREVIEW_DIR,
     ) -> None:
@@ -128,6 +130,7 @@ class FollowUpReminder:
         self.after = timedelta(days=self.notify.followup_after_days)
         self.repo = repo
         self.queue = queue
+        self.candidate_id = candidate_id
         self.clock = clock
         self.preview_dir = preview_dir
 
@@ -149,8 +152,27 @@ class FollowUpReminder:
         data = json.loads(raw)
         return int(data.get("count", 0)), from_iso(data["last"]) if data.get("last") else None
 
-    def status(self, job: Job) -> tuple[datetime, datetime, int]:
+    def status(self, job: Job, candidate_id: str | None = None) -> tuple[datetime, datetime, int]:
         """(applied, quiet since, reminders sent) for an Applied job."""
+        cid = candidate_id or self.candidate_id
+        if cid:
+            app = self.repo.get_candidate_application(cid, job.id)
+            if app and app.applied_at:
+                applied = from_iso(app.applied_at)
+            elif app and app.created_at:
+                applied = from_iso(app.created_at)
+            else:
+                applied = from_iso(job.user_status_at or job.updated_at)
+            count, last = self._sent(job.id)
+            since = [applied, *([last] if last else [])]
+            if day := (
+                self.repo.get_setting(f"followed_up:{cid}:{job.id}")
+                or self.repo.get_setting(FOLLOWED_UP + job.id)
+            ):
+                local = datetime.fromisoformat(day).replace(tzinfo=self.notify.tz)
+                since.append(local)
+            return applied, max(since), count
+
         applied = from_iso(job.user_status_at or job.updated_at)
         count, last = self._sent(job.id)
         since = [applied, *([last] if last else [])]
@@ -160,16 +182,31 @@ class FollowUpReminder:
         return applied, max(since), count
 
     def due(self) -> list[Due]:
+        cand, active_profile = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        if self.candidate_id and (cand is None or active_profile is None):
+            return []
+
         now = self.clock()
         found = []
-        for job in self.repo.jobs_applied():
-            if self.repo.get_setting(REPLIED + job.id):
-                continue  # the company wrote back: no nudging
-            applied, since, count = self.status(job)
-            if count >= MAX_REMINDERS or now - since < self.after or now - since > QUIET_AFTER:
-                continue
-            local = applied.astimezone(self.notify.tz)
-            found.append(Due(job, local, (now - since).days, count + 1))
+        if cand:
+            pairs = self.repo.list_candidate_applications_with_jobs(cand.id, statuses=["applied"])
+            for _app, job in pairs:
+                if self.repo.get_setting(REPLIED + job.id):
+                    continue
+                applied, since, count = self.status(job, candidate_id=cand.id)
+                if count >= MAX_REMINDERS or now - since < self.after or now - since > QUIET_AFTER:
+                    continue
+                local = applied.astimezone(self.notify.tz)
+                found.append(Due(job, local, (now - since).days, count + 1))
+        else:
+            for job in self.repo.jobs_applied():
+                if self.repo.get_setting(REPLIED + job.id):
+                    continue  # the company wrote back: no nudging
+                applied, since, count = self.status(job)
+                if count >= MAX_REMINDERS or now - since < self.after or now - since > QUIET_AFTER:
+                    continue
+                local = applied.astimezone(self.notify.tz)
+                found.append(Due(job, local, (now - since).days, count + 1))
         return found
 
     # ---- sending --------------------------------------------------------------------------
@@ -193,9 +230,20 @@ class FollowUpReminder:
                                 own_post(self.repo, job.id))  # fmt: skip
         return dr
 
-    def draft_for(self, job: Job) -> Draft | None:
+    def draft_for(self, job: Job, candidate_id: str | None = None) -> Draft | None:
         """The follow-up JobRadar would send you for an Applied job (the next one: first or
         second), whether or not it's due yet; None past the second or for other statuses."""
+        cid = candidate_id or self.candidate_id
+        if cid:
+            app = self.repo.get_candidate_application(cid, job.id)
+            if app is None or app.status != "applied":
+                return None
+            applied, _, count = self.status(job, candidate_id=cid)
+            if count >= MAX_REMINDERS:
+                return None
+            local = applied.astimezone(self.notify.tz).date()
+            return self._draft(job, local, count + 1, self._profile())
+
         if job.status != JobStatus.APPLIED.value or not job.user_status_at:
             return None
         applied, _, count = self.status(job)
@@ -224,9 +272,12 @@ class FollowUpReminder:
             drafts.append(self._draft(d.job, d.applied.date(), d.nth, profile))
         secrets = self.settings.secrets
         sender = secrets.email_address or "jobradar@localhost"
+        cand, _ = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        actions = Actions.load(
+            self.settings, self.repo, candidate_id=cand.id if cand else None, clock=self.clock
+        )
         msg = build_followups(due, drafts, sender, secrets.notify_address or sender, self.after,
-                              Actions.load(self.settings, self.repo),
-                              self.settings.config.notion.enabled)  # fmt: skip
+                              actions, self.settings.config.notion.enabled)  # fmt: skip
         if self.notify.dry_run:
             path = save_preview(msg, self.preview_dir / f"followup-{local:%Y%m%d-%H%M}.html")
             log.info("dry run: follow-up reminder saved",

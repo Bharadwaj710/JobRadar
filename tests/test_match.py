@@ -442,3 +442,73 @@ async def test_old_postings_reach_the_inbox_but_never_alert(
     assert (alerts.queued == ["job1"]) is alerted
     job = repo.get_job("job1")
     assert job is not None and job.status == JobStatus.NEW  # in your Inbox either way
+
+
+async def test_candidate_independent_matching_preserves_shared_inventory(
+    repo: Repo, queue: TaskQueue
+) -> None:
+    """Verifies Task 2.2 shared inventory isolation in multi-candidate mode."""
+    from jobradar.config import ScoringConfig
+
+    # 1. Senior job (5+ years exp)
+    seed_job(
+        repo,
+        "senior_job",
+        role="Lead Systems Architect",
+        experience_min=5.0,
+        locations=["London, UK"],
+    )
+    # 2. Non-owner track job (QA / SDET)
+    seed_job(
+        repo,
+        "sdet_job",
+        role="Staff SDET Engineer",
+        experience_min=4.0,
+        locations=["Tokyo, Japan"],
+    )
+    # 3. Ad / webinar (not a job)
+    seed_job(
+        repo,
+        "ad_job",
+        role=None,
+        confidence=0.05,
+        summary="Free webinar on AI tools, not an employment opportunity.",
+    )
+
+    alerts = Alerts()
+    # Initialized with candidate_independent=True
+    m = Matcher(
+        repo,
+        queue,
+        [FakeProvider("llm", GOOD)],
+        PROFILE,
+        "v1",
+        MatchingConfig(candidate_independent=True),
+        FILTERS,
+        ScoringConfig(alert_above=75),
+        alerts,
+        clock=CLOCK,
+        candidate_independent=True,
+    )
+
+    for jid in ("senior_job", "sdet_job", "ad_job"):
+        queue.enqueue(MATCH, jid)
+    await run(queue, m)
+
+    # Senior job is preserved as NEW in shared inventory, though owner is ineligible
+    j_senior = repo.get_job("senior_job")
+    assert j_senior is not None
+    assert j_senior.status == JobStatus.NEW
+    assert j_senior.score_reason == "Not eligible: needs 5+ years"
+
+    # SDET international job is preserved as NEW in shared inventory
+    j_sdet = repo.get_job("sdet_job")
+    assert j_sdet is not None
+    assert j_sdet.status == JobStatus.NEW
+    assert "needs 4+ years" in (j_sdet.score_reason or "")
+
+    # Genuine source-level safeguard: ad/event is still HIDDEN
+    j_ad = repo.get_job("ad_job")
+    assert j_ad is not None
+    assert j_ad.status == JobStatus.HIDDEN
+    assert j_ad.score_reason == "not a job posting (ad or event)"

@@ -491,6 +491,20 @@
         if (row?.dataset.href) window.location.href = row.dataset.href;
       }
     });
+    // Candidate job: interactive career track switcher
+    const tabBtns = document.querySelectorAll(".track-tab-btn");
+    tabBtns.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const targetId = btn.getAttribute("data-tab");
+        if (!targetId) return;
+        tabBtns.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        document.querySelectorAll(".track-tab-pane").forEach((pane) => {
+          pane.hidden = pane.id !== targetId;
+        });
+      });
+    });
+
     // All jobs: changing the sort or Show applies it straight away
     document.querySelectorAll("[data-autosubmit], #show, .finder input[name=place]").forEach((el) => {
       el.addEventListener("change", () => el.form?.requestSubmit());

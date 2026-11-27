@@ -26,6 +26,7 @@ from jobradar.pipeline.skill_gaps import Gap, gap_line, skill_gaps
 from jobradar.pipeline.task_types import DIGEST
 from jobradar.profile import load_profile
 from jobradar.queue.tasks import TaskQueue
+from jobradar.sinks.candidate_context import resolve_sink_candidate
 from jobradar.sinks.email_actions import Actions
 from jobradar.sinks.email_notify import (
     PREVIEW_DIR,
@@ -101,6 +102,8 @@ class DigestData:
     boards: list[tuple[Job, str]] = field(default_factory=list)  # (job, "Greenhouse · Stripe")
     skill_gaps: list[Gap] = field(default_factory=list)  # once a week: skills you keep missing
     gap_jobs: int = 0  # good matches the gaps were counted over
+    scores_map: dict[str, int | None] = field(default_factory=dict)
+    legacy_map: dict[str, bool] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
@@ -108,7 +111,13 @@ class DigestData:
 
 
 def gather(
-    repo: Repo, settings: Settings, since: datetime, until: datetime, bounded: bool = False
+    repo: Repo,
+    settings: Settings,
+    since: datetime,
+    until: datetime,
+    bounded: bool = False,
+    candidate_id: str | None = None,
+    profile_version: int | None = None,
 ) -> DigestData:
     """What happened between `since` and `until`. `bounded`: leave out anything after
     `until` (an earlier digest, seen again on the dashboard); the email digest runs at
@@ -116,26 +125,75 @@ def gather(
     end = to_iso(until) if bounded else None
     jobs = repo.jobs_created_since(to_iso(since), end)
     data = DigestData(since=since, until=until, new=len(jobs))
-    data.inbox = sorted(
-        (j for j in jobs if j.status == JobStatus.NEW.value),
-        key=lambda j: (j.score is None, -(j.score or 0)),
-    )
+
+    if candidate_id:
+        apps = {a.job_id: a.status for a in repo.list_candidate_applications(candidate_id)}
+        inbox_candidates = [
+            j
+            for j in jobs
+            if j.status not in (JobStatus.HIDDEN.value, JobStatus.DISCARDED.value)
+            and apps.get(j.id) not in ("applied", "interviewing", "offered", "rejected", "skipped")
+        ]
+        for j in inbox_candidates:
+            if profile_version is not None:
+                ass = repo.list_candidate_assessments(
+                    candidate_id, j.id, profile_version=profile_version
+                )
+                if ass:
+                    best_ass = max(ass, key=lambda a: a.technical_score or 0)
+                    data.scores_map[j.id] = best_ass.technical_score
+                    data.legacy_map[j.id] = False
+                    continue
+            hist = repo.get_historical_assessment(candidate_id, j.id)
+            if hist:
+                data.scores_map[j.id] = hist.score
+                data.legacy_map[j.id] = True
+            else:
+                data.scores_map[j.id] = j.score
+                data.legacy_map[j.id] = True
+
+        data.inbox = sorted(
+            inbox_candidates,
+            key=lambda j: (data.scores_map.get(j.id) is None, -(data.scores_map.get(j.id) or 0)),
+        )
+    else:
+        data.inbox = sorted(
+            (j for j in jobs if j.status == JobStatus.NEW.value),
+            key=lambda j: (j.score is None, -(j.score or 0)),
+        )
+
     for job in jobs:
         if job.status in (JobStatus.HIDDEN.value, JobStatus.DISCARDED.value):
             kind = hidden_kind(job.score_reason)
             data.hidden[kind] = data.hidden.get(kind, 0) + 1
     today = until.date()
-    data.closing = repo.jobs_closing(
+    closing = repo.jobs_closing(
         today.isoformat(), (today + timedelta(days=CLOSING_DAYS)).isoformat()
     )
+    if candidate_id:
+        apps = {a.job_id: a.status for a in repo.list_candidate_applications(candidate_id)}
+        data.closing = [
+            j
+            for j in closing
+            if apps.get(j.id) not in ("applied", "interviewing", "offered", "rejected", "skipped")
+        ]
+    else:
+        data.closing = closing
+
     data.alerts = repo.alerts_sent_since(to_iso(since), end)
     data.failed = repo.task_counts()[TaskStatus.FAILED]
     midnight = until.replace(hour=0, minute=0, second=0, microsecond=0)
     data.spent_inr = repo.llm_spend_since(to_iso(midnight))
     data.budget_inr = settings.config.llm.daily_budget_inr
-    counts = repo.status_counts()
-    data.pipeline = {s: counts.get(s, 0) for s in _PIPELINE}
-    data.moved = repo.status_changes_since(to_iso(since), end)
+
+    if candidate_id:
+        data.pipeline = repo.get_candidate_application_counts(candidate_id)
+        data.moved = repo.candidate_status_changes_since(candidate_id, to_iso(since), end)
+    else:
+        counts = repo.status_counts()
+        data.pipeline = {s: counts.get(s, 0) for s in _PIPELINE}
+        data.moved = repo.status_changes_since(to_iso(since), end)
+
     for job in data.inbox:
         board = next((s for s in repo.job_sightings(job.id) if s.platform == "board"), None)
         if board is not None:
@@ -214,8 +272,14 @@ def build_digest(
         text += ["", "TOP MATCHES"]
         for job in data.inbox[:TOP]:
             card, card_text = job_card(
-                job, notion=notion_url(job.notion_page_id, notion), compact=True,
-                actions=actions.job_links(job) if actions else None, dashboard=dashboard,
+                job,
+                notion=notion_url(job.notion_page_id, notion),
+                compact=True,
+                actions=actions.job_links(job) if actions else None,
+                dashboard=dashboard,
+                score=data.scores_map.get(job.id),
+                score_override=job.id in data.scores_map,
+                is_legacy=data.legacy_map.get(job.id, False),
             )  # fmt: skip
             rows.append(card)
             text.append(card_text)
@@ -232,7 +296,7 @@ def build_digest(
         rows.append(heading("From company boards"))
         text += ["", "FROM COMPANY BOARDS"]
         items = "".join(
-            f"<tr><td width='52' style='padding:10px 0 10px 14px;font-size:13px;font-weight:700;color:{GOOD[1] if (job.score or 0) >= 75 else MUTED}'>{esc(str(job.score) if job.score is not None else chr(8211))}</td>"
+            f"<tr><td width='52' style='padding:10px 0 10px 14px;font-size:13px;font-weight:700;color:{GOOD[1] if ((data.scores_map.get(job.id) or job.score or 0) >= 75) else MUTED}'>{esc(str(data.scores_map.get(job.id, job.score)) if (data.scores_map.get(job.id, job.score) is not None) else chr(8211))}</td>"
             f"<td style='padding:10px 14px 10px 8px;font-size:14px;color:{INK}'>{esc(_title(job))}"
             f"<div style='font-size:12px;color:{MUTED};margin-top:2px'>{esc(board)}</div></td>"
             f"<td align='right' style='padding:10px 14px 10px 0;font-size:13px;white-space:nowrap'>"
@@ -249,7 +313,7 @@ def build_digest(
             f"style='background:{CARD};border:1px solid {LINE};border-radius:12px'>{items}</table></td></tr>"
         )
         text += [
-            f"  {job.score if job.score is not None else '-':>3}  {_title(job)} ({board})"
+            f"  {(data.scores_map.get(job.id) or job.score) if (data.scores_map.get(job.id) or job.score) is not None else '-':>3}  {_title(job)} ({board})"
             for job, board in data.boards[:10]
         ]
 
@@ -342,6 +406,7 @@ class Digest:
         settings: Settings,
         repo: Repo,
         queue: TaskQueue,
+        candidate_id: str | None = None,
         clock: Clock = utcnow,
         preview_dir: Path = PREVIEW_DIR,
     ) -> None:
@@ -349,6 +414,7 @@ class Digest:
         self.notify = settings.config.notify
         self.repo = repo
         self.queue = queue
+        self.candidate_id = candidate_id
         self.clock = clock
         self.preview_dir = preview_dir
 
@@ -381,7 +447,29 @@ class Digest:
         what happened, for logs and the CLI."""
         now = self._local_now()
         since = previous_slot(now - timedelta(minutes=1), self.notify.digest_times)
-        data = gather(self.repo, self.settings, since, now)
+
+        cand, active_profile = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        if self.candidate_id and (cand is None or active_profile is None):
+            log.warning(
+                "candidate profile not confirmed or candidate not found; skipping digest",
+                extra={"candidate_id": self.candidate_id},
+            )
+            return "candidate profile not confirmed: digest skipped"
+
+        if cand and active_profile:
+            data = gather(
+                self.repo,
+                self.settings,
+                since,
+                now,
+                candidate_id=cand.id,
+                profile_version=active_profile.version,
+            )
+            actions = Actions.load(self.settings, self.repo, candidate_id=cand.id, clock=self.clock)
+        else:
+            data = gather(self.repo, self.settings, since, now)
+            actions = Actions.load(self.settings, self.repo, clock=self.clock)
+
         if data.empty:
             log.info("digest skipped: nothing new", extra={"since": since.isoformat()})
             return "nothing new since the last digest: not sent"
@@ -392,7 +480,7 @@ class Digest:
         sender = secrets.email_address or "jobradar@localhost"
         msg = build_digest(
             data, sender, secrets.notify_address or sender, secrets.notion_database_id,
-            Actions.load(self.settings, self.repo), dashboard_link(self.settings),
+            actions, dashboard_link(self.settings),
             self.settings.config.notion.enabled,
         )  # fmt: skip
         if self.notify.dry_run:

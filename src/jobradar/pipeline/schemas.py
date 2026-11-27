@@ -12,6 +12,20 @@ from pydantic import BaseModel, Field, field_validator
 EmploymentType = Literal["full_time", "internship", "contract", "unknown"]
 WorkMode = Literal["onsite", "hybrid", "remote", "unknown"]
 FieldKind = Literal["text", "textarea", "choice", "file", "date", "number", "unknown"]
+TrackName = Literal["ai_backend", "full_stack", "sde", "sdet"]
+TrackStrength = Literal["strong", "possible"]
+RequirementSource = Literal["title", "page", "post"]
+SkillRelation = Literal["all", "any"]
+ExperienceNeed = Literal["required", "preferred"]
+ExperienceType = Literal["professional", "internship", "academic", "unspecified"]
+ExperienceStatus = Literal["not_stated", "known", "conflicting"]
+StudentRequirementKind = Literal[
+    "fresher_welcome",
+    "no_experience_required",
+    "current_student",
+    "degree_in_progress",
+    "internship_experience",
+]
 
 
 def _one_of(value: Any, allowed: tuple[str, ...]) -> str:
@@ -48,6 +62,64 @@ class FormField(BaseModel):
         return _one_of(v, ("text", "textarea", "choice", "file", "date", "number"))
 
 
+class RequirementEvidence(BaseModel):
+    """The exact local text behind one deterministic conclusion."""
+
+    sentence: str = Field(min_length=1, max_length=800)
+    section: str | None = Field(default=None, max_length=120)
+    source: RequirementSource
+
+
+class RoleTrack(BaseModel):
+    track: TrackName
+    strength: TrackStrength
+    evidence: list[RequirementEvidence] = Field(min_length=1)
+
+
+class SkillRequirement(BaseModel):
+    skills: list[str] = Field(min_length=1)
+    relation: SkillRelation = "all"
+    evidence: RequirementEvidence
+
+    @field_validator("skills", mode="before")
+    @classmethod
+    def _skills(cls, value: Any) -> list[str]:
+        return _str_list(value)
+
+
+class GeneralQualification(BaseModel):
+    qualification: str = Field(min_length=1, max_length=300)
+    need: ExperienceNeed = "required"
+    evidence: RequirementEvidence
+
+
+class ExperienceRequirement(BaseModel):
+    need: ExperienceNeed
+    experience_type: ExperienceType = "unspecified"
+    minimum_years: float | None = Field(default=None, ge=0, le=50)
+    maximum_years: float | None = Field(default=None, ge=0, le=50)
+    subject: str | None = Field(default=None, max_length=120)
+    evidence: RequirementEvidence
+
+
+class StudentRequirement(BaseModel):
+    kind: StudentRequirementKind
+    required: bool
+    evidence: RequirementEvidence
+
+
+class JobRequirements(BaseModel):
+    """Conservative deterministic requirements. Empty categories mean not stated."""
+
+    required_skills: list[SkillRequirement] = Field(default_factory=list)
+    preferred_skills: list[SkillRequirement] = Field(default_factory=list)
+    employer_technologies: list[SkillRequirement] = Field(default_factory=list)
+    general_qualifications: list[GeneralQualification] = Field(default_factory=list)
+    experience: list[ExperienceRequirement] = Field(default_factory=list)
+    student_requirements: list[StudentRequirement] = Field(default_factory=list)
+    experience_status: ExperienceStatus = "not_stated"
+
+
 class JobPosting(BaseModel):
     company: str | None = None
     role: str | None = None
@@ -60,6 +132,8 @@ class JobPosting(BaseModel):
     degrees: list[str] = Field(default_factory=list)
     skills_required: list[str] = Field(default_factory=list)
     skills_preferred: list[str] = Field(default_factory=list)
+    role_tracks: list[RoleTrack] = Field(default_factory=list)
+    requirements: JobRequirements | None = None
     salary_text: str | None = None
     deadline: date | None = None
     apply_url: str | None = None

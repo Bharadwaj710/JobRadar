@@ -10,7 +10,7 @@ import json
 import re
 import zlib
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -23,15 +23,28 @@ from markupsafe import Markup, escape
 from jobradar.by_source import UNDO_MINUTES, Application, SourceRow, by_source
 from jobradar.clock import to_iso
 from jobradar.config import Settings
-from jobradar.db.models import Artifact, Job, JobStatus
+from jobradar.db.models import (
+    Artifact,
+    CandidateApplication,
+    CandidateApplicationStatus,
+    CandidateHistoricalAssessment,
+    CandidateJobAssessment,
+    Job,
+    JobLead,
+    JobStatus,
+    JobTrackMatch,
+)
 from jobradar.db.repo import Repo
 from jobradar.pipeline import status_rules as rules
+from jobradar.pipeline.eligibility import EligibilityResult
+from jobradar.pipeline.leads import LeadContact, LeadEnrichment
 from jobradar.pipeline.schemas import JobPosting
 from jobradar.pipeline.skill_detail import Detail as Needs
 from jobradar.pipeline.skill_detail import detail, spelling
 from jobradar.pipeline.skill_gaps import Demand, Gap, demand, skill_gaps
 from jobradar.pipeline.task_types import BUILD_RESUME
-from jobradar.profile import skill_names, skill_warnings
+from jobradar.pipeline.technical_match import TrackAssessment
+from jobradar.profile import TRACK_NAMES, TrackName, skill_names, skill_warnings
 from jobradar.providers.base import MatchAnswers
 from jobradar.providers.skills_rule import compare_skills, skill_key
 from jobradar.queue.tasks import TaskQueue
@@ -61,6 +74,34 @@ LABELS = {
 TODAY_DAYS = 3  # Today lists good matches first seen this recently
 FRESH_HOURS = 6  # a job first seen this recently is marked "new"
 PER_PAGE = 50
+
+TRACK_LABELS: dict[TrackName, str] = {
+    "ai_backend": "AI / backend",
+    "full_stack": "Full-stack",
+    "sde": "SDE",
+    "sdet": "SDET",
+}
+TRACK_CHOICES = [("", "All tracks"), *[(track, TRACK_LABELS[track]) for track in TRACK_NAMES]]
+ELIGIBILITY_LABELS = {
+    "ELIGIBLE": "Eligible",
+    "LIKELY_ELIGIBLE": "Likely eligible",
+    "NEEDS_VERIFICATION": "Needs verification",
+    "NOT_ELIGIBLE": "Not eligible",
+}
+ELIGIBILITY_CHOICES = [("", "Any eligibility"), *ELIGIBILITY_LABELS.items()]
+TECHNICAL_SCORES = [(0, "Any technical fit"), (50, "50+"), (70, "70+"), (80, "80+"), (90, "90+")]
+WORK_MODES = [("", "Any work mode"), ("remote", "Remote"), ("hybrid", "Hybrid"),
+              ("onsite", "Onsite")]  # fmt: skip
+PUBLISHED_WITHIN = [(0, "Any publication date"), (1, "Published in 24 h"),
+                    (3, "Published in 3 days"), (7, "Published this week"),
+                    (30, "Published this month")]  # fmt: skip
+PRIORITY_LABELS = {
+    "apply_now": "Apply now",
+    "review": "Review",
+    "low": "Low priority",
+    "exclude": "Excluded",
+}
+PRIORITY_CHOICES = [("", "Any application priority"), *PRIORITY_LABELS.items()]
 
 # The Applications board: (column, the statuses in it).
 # The Applications board: (column, the status a card dropped there gets, the statuses in it).
@@ -144,6 +185,151 @@ def _place(posting: JobPosting | None) -> str:
 
 
 @dataclass(frozen=True)
+class TrackMatchCard:
+    state: str  # current, partial, stale, or unavailable
+    version: str | None
+    primary: str | None
+    primary_label: str | None
+    secondary: list[str]
+    score: int | None
+    evidence: int | None
+    eligibility: str | None
+    eligibility_label: str | None
+    resume: str | None
+    message: str
+
+
+def _track_label(value: str) -> str:
+    return next(
+        (label for track, label in TRACK_LABELS.items() if track == value),
+        value.replace("_", " ").title(),
+    )
+
+
+@dataclass(frozen=True)
+class LeadCard:
+    state: str
+    profile_version: str
+    priority: str
+    priority_label: str
+    primary_track_label: str
+    vacancy: str
+    vacancy_label: str
+
+
+def _lead_enrichment(row: JobLead) -> LeadEnrichment | None:
+    try:
+        return LeadEnrichment.model_validate_json(row.enrichment_json)
+    except ValueError:
+        return None
+
+
+def lead_card(row: JobLead | None, active_version: str | None) -> LeadCard | None:
+    if row is None or _lead_enrichment(row) is None:
+        return None
+    priority_label = PRIORITY_LABELS.get(
+        row.application_priority, row.application_priority.replace("_", " ").title()
+    )
+    return LeadCard(
+        "current"
+        if active_version is not None and row.profile_version == active_version
+        else "stale",
+        row.profile_version,
+        row.application_priority,
+        priority_label,
+        _track_label(row.primary_track),
+        row.vacancy_status,
+        row.vacancy_status.capitalize(),
+    )
+
+
+def _track_assessment(
+    row: JobTrackMatch | CandidateJobAssessment,
+) -> TrackAssessment | None:
+    try:
+        return TrackAssessment.model_validate_json(row.assessment_json)
+    except ValueError:
+        return None
+
+
+def _role_alignment(assessment: TrackAssessment) -> float:
+    component = assessment.components.get("role_alignment")
+    return component.value if component is not None and component.value is not None else 0
+
+
+def _track_rank(assessment: TrackAssessment) -> tuple[bool, int, float, float, int]:
+    return (
+        assessment.score is not None,
+        assessment.score or -1,
+        _role_alignment(assessment),
+        assessment.evidence_coverage,
+        -TRACK_NAMES.index(assessment.track),
+    )
+
+
+def track_card(
+    rows: Sequence[JobTrackMatch | CandidateJobAssessment], active_version: str | None
+) -> TrackMatchCard:
+    """The current profile's compact assessment; older rows only make the state stale."""
+
+    if active_version is None:
+        return TrackMatchCard(
+            "stale" if rows else "unavailable",
+            None,
+            None,
+            None,
+            [],
+            None,
+            None,
+            None,
+            None,
+            None,
+            "The active profile has no evidence-backed four-track views.",
+        )
+    current = [row for row in rows if str(row.profile_version) == str(active_version)]
+    if not current:
+        return TrackMatchCard(
+            "stale" if rows else "unavailable",
+            active_version,
+            None,
+            None,
+            [],
+            None,
+            None,
+            None,
+            None,
+            None,
+            (
+                "Assessments exist only for an older profile version."
+                if rows
+                else "No assessment exists for the active profile version."
+            ),
+        )
+    parsed = [assessment for row in current if (assessment := _track_assessment(row))]
+    aligned = [assessment for assessment in parsed if _role_alignment(assessment) > 0]
+    primary = max(aligned, key=_track_rank) if aligned else None
+    ordered = sorted(
+        (item for item in aligned if item is not primary), key=_track_rank, reverse=True
+    )
+    eligibility = current[0].eligibility_status
+    available = len({assessment.track for assessment in parsed})
+    complete = available == len(TRACK_NAMES)
+    return TrackMatchCard(
+        "current" if complete else "partial",
+        active_version,
+        primary.track if primary else None,
+        TRACK_LABELS[primary.track] if primary else None,
+        [TRACK_LABELS[item.track] for item in ordered],
+        primary.score if primary else None,
+        round(100 * primary.evidence_coverage) if primary else None,
+        eligibility,
+        ELIGIBILITY_LABELS.get(eligibility, eligibility.replace("_", " ").title()),
+        primary.recommended_resume if primary else None,
+        "" if complete else f"Only {available} of {len(TRACK_NAMES)} track results are valid.",
+    )
+
+
+@dataclass(frozen=True)
 class Card:
     """One job as a line on a list or a card on the board."""
 
@@ -168,6 +354,15 @@ class Card:
     age: str  # "3 h ago"
     fresh: bool  # first seen in the last few hours
     actions: list[tuple[str, str]]  # the buttons for its status: (action, label)
+    work_mode: str = ""
+    published: str = ""
+    track_match: TrackMatchCard | None = None
+    lead: LeadCard | None = None
+    closed_by_employer: bool = False
+    historical_score: int | None = None
+    is_legacy_score: bool = False
+    legacy_score_reason: str = ""
+    candidate_status: str | None = None
 
 
 def initials(name: str) -> str:
@@ -224,7 +419,55 @@ def buttons(job: Job) -> list[tuple[str, str]]:
     return [(a, BUTTON_LABELS[a]) for a in _BUTTONS.get(job.status, []) if rules.can(a, job)]
 
 
-def card(job: Job, tz: ZoneInfo, now: datetime | None = None) -> Card:
+CANDIDATE_STATUS_LABELS: dict[str, str] = {
+    "saved": "Shortlisted",
+    "shortlisted": "Shortlisted",
+    "resume_ready": "Resume ready",
+    "applied": "Applied",
+    "interviewing": "Interview",
+    "interview": "Interview",
+    "offered": "Offer",
+    "offer": "Offer",
+    "rejected": "Rejected",
+    "skipped": "Skipped",
+    "new": "New",
+}
+
+
+def candidate_label(status: str) -> str:
+    return CANDIDATE_STATUS_LABELS.get(status, status.replace("_", " ").capitalize())
+
+
+CANDIDATE_BUTTONS: dict[str, list[str]] = {
+    "new": ["applied", "shortlist", "skip"],
+    "saved": ["applied", "skip"],
+    "shortlisted": ["applied", "skip"],
+    "resume_ready": ["applied", "skip"],
+    "applied": ["interview", "followed up", "rejected"],
+    "interviewing": ["offer", "rejected"],
+    "interview": ["offer", "rejected"],
+    "offered": [],
+    "offer": [],
+    "rejected": [],
+    "skipped": ["shortlist", "applied"],
+}
+
+
+def candidate_actions(status: str) -> list[tuple[str, str]]:
+    acts = CANDIDATE_BUTTONS.get(status, ["applied", "shortlist", "skip"])
+    return [(a, BUTTON_LABELS[a]) for a in acts if a in BUTTON_LABELS]
+
+
+def card(
+    job: Job,
+    tz: ZoneInfo,
+    now: datetime | None = None,
+    track_match: TrackMatchCard | None = None,
+    lead: LeadCard | None = None,
+    application: CandidateApplication | None = None,
+    candidate_assessment: CandidateJobAssessment | None = None,
+    historical_assessment: CandidateHistoricalAssessment | None = None,
+) -> Card:
     posting = posting_of(job)
     company = job.company or ""
     reason = split_reason(job.score_reason, posting)
@@ -234,20 +477,62 @@ def card(job: Job, tz: ZoneInfo, now: datetime | None = None) -> Card:
             closes_in = (date.fromisoformat(job.deadline[:10]) - now.astimezone(tz).date()).days
         except ValueError:
             closes_in = None
-    days = None
-    if job.user_status_at and now is not None:
-        days = max((now - _at(job.user_status_at)).days, 0)
+
+    closed_by_employer = job.status in (JobStatus.HIDDEN.value, JobStatus.DISCARDED.value)
+
+    if application is not None:
+        status_val = application.status
+        status_lbl = candidate_label(application.status)
+        acts = candidate_actions(application.status)
+        if (
+            application.status == CandidateApplicationStatus.APPLIED.value
+            and application.applied_at
+        ):
+            moved = when(application.applied_at, tz)
+            days = max((now - _at(application.applied_at)).days, 0) if now is not None else None
+        else:
+            moved = when(application.updated_at, tz)
+            days = max((now - _at(application.updated_at)).days, 0) if now is not None else None
+    else:
+        status_val = job.status
+        status_lbl = label(job.status)
+        acts = buttons(job)
+        days = None
+        if job.user_status_at and now is not None:
+            days = max((now - _at(job.user_status_at)).days, 0)
+        moved = when(job.user_status_at, tz)
+
+    # Technical Score vs Historical Legacy Score separation
+    score: int | None = None
+    historical_score: int | None = None
+    is_legacy_score = False
+    legacy_score_reason = ""
+
+    if candidate_assessment is not None:
+        score = candidate_assessment.technical_score
+        if historical_assessment is not None:
+            historical_score = historical_assessment.score
+            legacy_score_reason = historical_assessment.score_reason
+    elif historical_assessment is not None:
+        # Never present historical legacy score as current J4 technical score
+        score = None
+        historical_score = historical_assessment.score
+        is_legacy_score = True
+        legacy_score_reason = historical_assessment.score_reason
+    else:
+        score = job.score
+
     return Card(
         id=job.id,
         role=job.role or "Role not stated",
         company=job.company or "",
-        score=job.score,
-        status=job.status,
-        status_label=label(job.status),
+        score=score,
+        status=status_val,
+        status_label=status_lbl,
         place=_place(posting),
         closes=day_month(job.deadline),
         seen=when(job.created_at, tz),
-        moved=when(job.user_status_at, tz),
+        moved=moved,
         reason=reason,
         initials=initials(company or job.role or "?"),
         hue=hue(company or job.role or "?"),
@@ -258,17 +543,65 @@ def card(job: Job, tz: ZoneInfo, now: datetime | None = None) -> Card:
         seen_at=job.created_at,
         age=ago(job.created_at, now) if now is not None else "",
         fresh=now is not None and now - _at(job.created_at) < timedelta(hours=FRESH_HOURS),
-        actions=buttons(job),
+        actions=acts,
+        work_mode=(
+            posting.work_mode.capitalize() if posting and posting.work_mode != "unknown" else ""
+        ),
+        published=(
+            day_month(posting.published_on.isoformat()) if posting and posting.published_on else ""
+        ),
+        track_match=track_match,
+        lead=lead,
+        closed_by_employer=closed_by_employer,
+        historical_score=historical_score,
+        is_legacy_score=is_legacy_score,
+        legacy_score_reason=legacy_score_reason,
+        candidate_status=application.status if application is not None else None,
     )
 
 
 # ---- Today -----------------------------------------------------------------------------------
 
 
-def today(repo: Repo, min_score: int, now: datetime, tz: ZoneInfo) -> list[Card]:
+def today(
+    repo: Repo,
+    min_score: int,
+    now: datetime,
+    tz: ZoneInfo,
+    candidate_id: str | None = None,
+) -> list[Card]:
     """Good matches you haven't acted on, first seen in the last few days, best first."""
     since = to_iso(now - timedelta(days=TODAY_DAYS))
-    return [card(j, tz, now) for j in repo.good_new_jobs(min_score, since)]
+    jobs = repo.good_new_jobs(min_score, since)
+    if candidate_id:
+        apps = {a.job_id: a for a in repo.list_candidate_applications(candidate_id)}
+        assessments_by_job: dict[str, CandidateJobAssessment] = {}
+        for a in repo.list_candidate_assessments(candidate_id):
+            if a.job_id not in assessments_by_job or (
+                a.technical_score is not None
+                and assessments_by_job[a.job_id].technical_score is None
+            ):
+                assessments_by_job[a.job_id] = a
+        historical_by_job: dict[str, CandidateHistoricalAssessment] = {
+            h.job_id: h for h in repo.list_historical_assessments(candidate_id)
+        }
+        active_jobs = [
+            j
+            for j in jobs
+            if apps.get(j.id) is None or apps[j.id].status in ("saved", "shortlisted")
+        ]
+        return [
+            card(
+                j,
+                tz,
+                now,
+                application=apps.get(j.id),
+                candidate_assessment=assessments_by_job.get(j.id),
+                historical_assessment=historical_by_job.get(j.id),
+            )
+            for j in active_jobs
+        ]
+    return [card(j, tz, now) for j in jobs]
 
 
 # ---- Applications ----------------------------------------------------------------------------
@@ -304,7 +637,14 @@ class Column:
 REPLY_WORDS = {"interview": "Interview invite", "test": "Online test", "rejected": "Rejection"}
 
 
-def track(repo: Repo, job: Job, tz: ZoneInfo, now: datetime, nudges: FollowUpReminder) -> Track:
+def track(
+    repo: Repo,
+    job: Job,
+    tz: ZoneInfo,
+    now: datetime,
+    nudges: FollowUpReminder,
+    application: CandidateApplication | None = None,
+) -> Track:
     raw = repo.get_setting(REPLIED + job.id)
     replied = None
     if raw:
@@ -314,14 +654,36 @@ def track(repo: Repo, job: Job, tz: ZoneInfo, now: datetime, nudges: FollowUpRem
             replied = None
     followed = repo.get_setting(FOLLOWED_UP + job.id) or ""
     next_nudge, nudge_in, waited, reminders = "", None, 0, 0
-    if job.status == JobStatus.APPLIED.value and job.user_status_at and replied is None:
-        _, since, reminders = nudges.status(job)
-        if reminders < MAX_REMINDERS:
-            due = since + nudges.after
-            nudge_in = max((due.astimezone(tz).date() - now.astimezone(tz).date()).days, 0)
-            next_nudge = f"{due.astimezone(tz).day} {due.astimezone(tz):%b}"
-            total = nudges.after.total_seconds()
-            waited = min(100, max(0, round(100 * (now - since).total_seconds() / total)))
+
+    app_applied = (
+        application is not None
+        and application.status == CandidateApplicationStatus.APPLIED.value
+        and application.applied_at is not None
+    )
+    legacy_applied = (
+        application is None
+        and job.status == JobStatus.APPLIED.value
+        and job.user_status_at is not None
+    )
+
+    if (app_applied or legacy_applied) and replied is None:
+        if app_applied and application is not None and application.applied_at:
+            since = _at(application.applied_at)
+            reminders = 0
+            if reminders < MAX_REMINDERS:
+                due = since + nudges.after
+                nudge_in = max((due.astimezone(tz).date() - now.astimezone(tz).date()).days, 0)
+                next_nudge = f"{due.astimezone(tz).day} {due.astimezone(tz):%b}"
+                total = nudges.after.total_seconds()
+                waited = min(100, max(0, round(100 * (now - since).total_seconds() / total)))
+        else:
+            _, since, reminders = nudges.status(job)
+            if reminders < MAX_REMINDERS:
+                due = since + nudges.after
+                nudge_in = max((due.astimezone(tz).date() - now.astimezone(tz).date()).days, 0)
+                next_nudge = f"{due.astimezone(tz).day} {due.astimezone(tz):%b}"
+                total = nudges.after.total_seconds()
+                waited = min(100, max(0, round(100 * (now - since).total_seconds() / total)))
     return Track(
         resume=repo.latest_artifact(job.id) is not None,
         replied=replied,
@@ -353,18 +715,106 @@ def _note(key: JobStatus, cards: list[BoardCard]) -> str:
     return ""
 
 
-def board(repo: Repo, settings: Settings, now: datetime) -> list[Column]:
+def board(
+    repo: Repo, settings: Settings, now: datetime, candidate_id: str | None = None
+) -> list[Column]:
     tz = settings.config.notify.tz
     nudges = FollowUpReminder(settings, repo, TaskQueue(repo))
+    if candidate_id:
+        apps_with_jobs = repo.list_candidate_applications_with_jobs(candidate_id)
+
+        # Preload assessments for candidate
+        assessments_by_job: dict[str, CandidateJobAssessment] = {}
+        for a in repo.list_candidate_assessments(candidate_id):
+            if a.job_id not in assessments_by_job or (
+                a.technical_score is not None
+                and assessments_by_job[a.job_id].technical_score is None
+            ):
+                assessments_by_job[a.job_id] = a
+
+        # Preload historical assessments for candidate
+        historical_by_job: dict[str, CandidateHistoricalAssessment] = {
+            h.job_id: h for h in repo.list_historical_assessments(candidate_id)
+        }
+
+        col_cards: dict[str, list[BoardCard]] = {
+            JobStatus.SHORTLISTED.value: [],
+            JobStatus.APPLIED.value: [],
+            JobStatus.INTERVIEW.value: [],
+            JobStatus.OFFER.value: [],
+            JobStatus.REJECTED.value: [],
+        }
+
+        status_col_map = {
+            "saved": JobStatus.SHORTLISTED.value,
+            "shortlisted": JobStatus.SHORTLISTED.value,
+            "resume_ready": JobStatus.SHORTLISTED.value,
+            "applied": JobStatus.APPLIED.value,
+            "interviewing": JobStatus.INTERVIEW.value,
+            "interview": JobStatus.INTERVIEW.value,
+            "offered": JobStatus.OFFER.value,
+            "offer": JobStatus.OFFER.value,
+            "rejected": JobStatus.REJECTED.value,
+        }
+
+        for app, j in apps_with_jobs:
+            target_col = status_col_map.get(app.status)
+            if not target_col or target_col not in col_cards:
+                continue
+            c = card(
+                j,
+                tz,
+                now,
+                application=app,
+                candidate_assessment=assessments_by_job.get(j.id),
+                historical_assessment=historical_by_job.get(j.id),
+            )
+            t = track(repo, j, tz, now, nudges, application=app)
+            col_cards[target_col].append(BoardCard(c, t))
+
+        columns = []
+        for title, key, _ in COLUMNS:
+            cards = col_cards.get(key.value, [])
+            columns.append(Column(key.value, title, cards, _note(key, cards)))
+        return columns
+
     columns = []
     for title, key, statuses in COLUMNS:
-        cards = [BoardCard(card(j, tz, now), track(repo, j, tz, now, nudges))
-                 for j in repo.jobs_in(statuses)]  # fmt: skip
+        cards = [
+            BoardCard(card(j, tz, now), track(repo, j, tz, now, nudges))
+            for j in repo.jobs_in(statuses)
+        ]
         columns.append(Column(key.value, title, cards, _note(key, cards)))
     return columns
 
 
 # ---- All jobs --------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AssessmentSummary:
+    version: str | None
+    total: int
+    assessed: int
+    stale: int
+    eligible: int
+    likely: int
+    verification: int
+    ineligible: int
+
+
+def assessment_summary(repo: Repo, version: str | None) -> AssessmentSummary:
+    counts = repo.track_dashboard_counts(version)
+    return AssessmentSummary(
+        version=version,
+        total=counts.total_jobs,
+        assessed=counts.assessed_jobs,
+        stale=counts.stale_jobs,
+        eligible=counts.eligibility.get("ELIGIBLE", 0),
+        likely=counts.eligibility.get("LIKELY_ELIGIBLE", 0),
+        verification=counts.eligibility.get("NEEDS_VERIFICATION", 0),
+        ineligible=counts.eligibility.get("NOT_ELIGIBLE", 0),
+    )
 
 
 @dataclass(frozen=True)
@@ -378,13 +828,17 @@ class JobList:
     sort: str = "new"
     filters: Filters = field(default_factory=lambda: Filters())
     snippets: dict[str, Markup] = field(default_factory=dict)  # job id -> where it matched
+    assessments: AssessmentSummary | None = None
 
     def query(self, page: int) -> str:
         """This search's address on another page."""
         f = self.filters
         pairs = {"q": self.words, "show": self.show, "sort": self.sort, "min": f.min_score or "",
                  "within": f.within or "", "place": f.place, "remote": "1" if f.remote else "",
-                 "source": f.source or "", "page": page}  # fmt: skip
+                  "source": f.source or "", "track": f.track, "eligibility": f.eligibility,
+                  "technical": f.technical_min or "", "mode": f.work_mode,
+                   "published": f.published_within or "", "priority": f.priority,
+                   "page": page}  # fmt: skip
         return "/jobs?" + urlencode({k: v for k, v in pairs.items() if v not in ("", None)})
 
 
@@ -395,11 +849,31 @@ class Filters:
     place: str = ""
     remote: bool = False
     source: int | None = None
+    track: str = ""
+    eligibility: str = ""
+    technical_min: int | None = None
+    work_mode: str = ""
+    published_within: int | None = None
+    priority: str = ""
 
     @property
     def active(self) -> int:
-        return sum(bool(x) for x in (self.min_score, self.within, self.place, self.remote,
-                                     self.source))  # fmt: skip
+        return sum(
+            bool(x)
+            for x in (
+                self.min_score,
+                self.within,
+                self.place,
+                self.remote,
+                self.source,
+                self.track,
+                self.eligibility,
+                self.technical_min,
+                self.work_mode,
+                self.published_within,
+                self.priority,
+            )
+        )
 
 
 MIN_SCORES = [(0, "Any score"), (50, "50+"), (75, "75+"), (90, "90+")]
@@ -434,6 +908,8 @@ def all_jobs(
     now: datetime | None = None,
     sort: str = "new",
     filters: Filters | None = None,
+    track_version: str | None = None,
+    candidate_id: str | None = None,
 ) -> JobList:
     filters = filters or Filters()
     now = now or datetime.now(UTC)
@@ -446,15 +922,94 @@ def all_jobs(
     if query:
         fts.refresh(repo, now)
     since = to_iso(now - timedelta(days=filters.within)) if filters.within else None
-    args = (show_statuses(show), query, filters.min_score or None, since, filters.source, sort)
-    _, total = repo.find_jobs(*args, 0, 0)
+    published_since = (
+        (now.astimezone(tz).date() - timedelta(days=filters.published_within)).isoformat()
+        if filters.published_within
+        else None
+    )
+    args = (
+        show_statuses(show),
+        query,
+        filters.min_score or None,
+        since,
+        filters.source,
+        track_version,
+        filters.track or None,
+        filters.eligibility or None,
+        filters.technical_min or None,
+        filters.work_mode or None,
+        published_since,
+        filters.priority or None,
+        sort,
+    )
+    _, total = repo.find_jobs(*args, 0, 0, candidate_id=candidate_id)
     pages = max(1, -(-total // PER_PAGE))
     page = min(max(page, 1), pages)
-    found, total = repo.find_jobs(*args, PER_PAGE, (page - 1) * PER_PAGE)
+    found, total = repo.find_jobs(*args, PER_PAGE, (page - 1) * PER_PAGE, candidate_id=candidate_id)
+    job_ids = [job.id for job, _ in found]
+    track_rows: dict[str, list[JobTrackMatch]] = {}
+    lead_rows = {row.job_id: row for row in repo.leads_for_jobs(job_ids)}
+
+    cand_assessments_map: dict[str, list[CandidateJobAssessment]] = {}
+    cand_apps_map: dict[str, CandidateApplication] = {}
+    if candidate_id and job_ids:
+        for ca in repo.list_candidate_assessments(candidate_id, job_ids=job_ids):
+            cand_assessments_map.setdefault(ca.job_id, []).append(ca)
+        for c_app in repo.list_candidate_applications(candidate_id, job_ids=job_ids):
+            cand_apps_map[c_app.job_id] = c_app
+    else:
+        for row in repo.track_matches_for_jobs(job_ids):
+            track_rows.setdefault(row.job_id, []).append(row)
+
+    cards: list[Card] = []
+    for j, _ in found:
+        if candidate_id and j.id in cand_assessments_map:
+            c_list = cand_assessments_map[j.id]
+            if filters.track:
+                matched_t = [a for a in c_list if a.track == filters.track]
+                primary_assessment = matched_t[0] if matched_t else c_list[0]
+            else:
+                primary_assessment = max(
+                    c_list,
+                    key=lambda a: a.technical_score if a.technical_score is not None else -1,
+                )
+            t_card = track_card(c_list, str(c_list[0].profile_version))
+            card_app = cand_apps_map.get(j.id)
+            cards.append(
+                card(
+                    j,
+                    tz,
+                    now,
+                    track_match=t_card,
+                    lead=lead_card(lead_rows.get(j.id), track_version),
+                    application=card_app,
+                    candidate_assessment=primary_assessment,
+                )
+            )
+        else:
+            cards.append(
+                card(
+                    j,
+                    tz,
+                    now,
+                    track_match=track_card(track_rows.get(j.id, []), track_version),
+                    lead=lead_card(lead_rows.get(j.id), track_version),
+                    application=cand_apps_map.get(j.id),
+                )
+            )
+
     return JobList(
-        [card(j, tz, now) for j, _ in found], total, page, pages, show, words, sort, filters,
+        cards,
+        total,
+        page,
+        pages,
+        show,
+        words,
+        sort,
+        filters,
         {j.id: fts.snippet(snip) for j, snip in found if snip},
-    )  # fmt: skip
+        assessment_summary(repo, track_version),
+    )
 
 
 # ---- One job ---------------------------------------------------------------------------------
@@ -483,6 +1038,123 @@ class File:
 
 
 @dataclass
+class EligibilityCheckView:
+    dimension: str
+    status: str
+    reason: str
+    evidence: list[str]
+
+
+@dataclass
+class EligibilityView:
+    status: str
+    label: str
+    blockers: list[str]
+    unresolved: list[str]
+    checks: list[EligibilityCheckView]
+
+
+@dataclass
+class TrackAssessmentView:
+    track: TrackName
+    label: str
+    available: bool
+    score: int | None = None
+    status: str = "unavailable"
+    evidence: int | None = None
+    matched_required: list[str] = field(default_factory=list)
+    missing_required: list[str] = field(default_factory=list)
+    preferred_skills: list[str] = field(default_factory=list)
+    matched_preferred: list[str] = field(default_factory=list)
+    projects: list[str] = field(default_factory=list)
+    internships: list[str] = field(default_factory=list)
+    experience: list[str] = field(default_factory=list)
+    explanation: str = ""
+    unscored_reason: str | None = None
+    resume: str | None = None
+
+
+@dataclass
+class TrackAssessmentSet:
+    state: str
+    active_version: str | None
+    stored_versions: list[str]
+    message: str
+    tracks: list[TrackAssessmentView]
+    eligibility: EligibilityView | None = None
+
+
+@dataclass
+class LeadPanel:
+    state: str
+    profile_version: str
+    priority: str
+    priority_label: str
+    primary_track_label: str
+    vacancy: str
+    eligibility: str
+    official_application_url: str
+    official_source_url: str
+    verified: str
+    technical_score: int | None
+    location: str | None
+    work_mode: str
+    compensation: str | None
+    internship_duration: str | None
+    mandatory_experience: list[str]
+    preferred_experience: list[str]
+    eligibility_evidence: list[str]
+    unresolved: list[str]
+    priority_reasons: list[str]
+    recommended_resume: str | None
+    contacts: list[LeadContact]
+    application_strategy: str
+    outreach_draft: str | None
+    cover_letter_draft: str | None
+
+
+def lead_panel(row: JobLead | None, active_version: str | None, tz: ZoneInfo) -> LeadPanel | None:
+    if row is None or (enrichment := _lead_enrichment(row)) is None:
+        return None
+    priority_label = PRIORITY_LABELS.get(
+        row.application_priority, row.application_priority.replace("_", " ").title()
+    )
+    return LeadPanel(
+        state=(
+            "current"
+            if active_version is not None and row.profile_version == active_version
+            else "stale"
+        ),
+        profile_version=row.profile_version,
+        priority=row.application_priority,
+        priority_label=priority_label,
+        primary_track_label=_track_label(row.primary_track),
+        vacancy=row.vacancy_status.capitalize(),
+        eligibility=ELIGIBILITY_LABELS.get(
+            row.eligibility_status, row.eligibility_status.replace("_", " ").title()
+        ),
+        official_application_url=enrichment.official_application_url,
+        official_source_url=enrichment.official_source_url,
+        verified=when(enrichment.last_verified_at.isoformat(), tz),
+        technical_score=enrichment.technical_score,
+        location=enrichment.location,
+        work_mode=enrichment.work_mode,
+        compensation=enrichment.compensation,
+        internship_duration=enrichment.internship_duration,
+        mandatory_experience=list(enrichment.mandatory_experience),
+        preferred_experience=list(enrichment.preferred_experience),
+        eligibility_evidence=list(enrichment.eligibility_evidence),
+        unresolved=list(enrichment.unresolved),
+        priority_reasons=list(enrichment.priority_reasons),
+        recommended_resume=enrichment.recommended_resume,
+        contacts=list(enrichment.contacts),
+        application_strategy=enrichment.application_strategy,
+        outreach_draft=enrichment.outreach_draft,
+        cover_letter_draft=enrichment.cover_letter_draft,
+    )
+
+
+@dataclass
 class Detail:
     card: Card
     take: str  # Blip's one-line reading of the score
@@ -500,6 +1172,132 @@ class Detail:
     building: bool = False  # a resume is queued or being built
     draft: Draft | None = None  # the follow-up JobRadar would send (Applied jobs)
     page_text: str | None = None
+    track_assessments: TrackAssessmentSet | None = None
+    lead: LeadPanel | None = None
+    candidate_application: CandidateApplication | None = None
+    historical_assessment: CandidateHistoricalAssessment | None = None
+    candidate_assessments: list[CandidateJobAssessment] = field(default_factory=list)
+
+
+def _job_skill_names(posting: JobPosting | None, preferred: bool) -> list[str]:
+    if posting is None:
+        return []
+    structured = []
+    if posting.requirements is not None:
+        structured = (
+            posting.requirements.preferred_skills
+            if preferred
+            else posting.requirements.required_skills
+        )
+    values = [skill for item in structured for skill in item.skills]
+    if not values:
+        values = posting.skills_preferred if preferred else posting.skills_required
+    return list(dict.fromkeys(values))
+
+
+def _eligibility_view(
+    row: JobTrackMatch | CandidateJobAssessment,
+) -> EligibilityView | None:
+    try:
+        result = EligibilityResult.model_validate_json(row.eligibility_json)
+    except ValueError:
+        return None
+    return EligibilityView(
+        result.state.value,
+        ELIGIBILITY_LABELS.get(result.state.value, result.state.value.replace("_", " ").title()),
+        list(result.blockers),
+        list(result.unresolved),
+        [
+            EligibilityCheckView(
+                check.dimension.replace("_", " ").title(),
+                check.status,
+                check.reason,
+                list(
+                    dict.fromkeys(
+                        evidence.sentence or evidence.value for evidence in check.evidence
+                    )
+                ),
+            )
+            for check in result.checks
+        ],
+    )
+
+
+def track_assessment_set(
+    rows: Sequence[JobTrackMatch | CandidateJobAssessment],
+    active_version: str | None,
+    posting: JobPosting | None,
+) -> TrackAssessmentSet:
+    stored = sorted({str(row.profile_version) for row in rows})
+    if active_version is None:
+        return TrackAssessmentSet(
+            "stale" if rows else "unavailable",
+            None,
+            stored,
+            "The active profile has no evidence-backed four-track views.",
+            [],
+        )
+    current = [row for row in rows if str(row.profile_version) == str(active_version)]
+    if not current:
+        return TrackAssessmentSet(
+            "stale" if rows else "unavailable",
+            active_version,
+            stored,
+            (
+                "Stored assessments use an older profile version; rematching has not been run."
+                if rows
+                else "This job has not been assessed for the active profile version."
+            ),
+            [],
+        )
+    by_track = {row.track: row for row in current}
+    required = _job_skill_names(posting, preferred=False)
+    preferred = _job_skill_names(posting, preferred=True)
+    panels: list[TrackAssessmentView] = []
+    for track in TRACK_NAMES:
+        row = by_track.get(track)
+        assessment = _track_assessment(row) if row is not None else None
+        if assessment is None:
+            panels.append(
+                TrackAssessmentView(
+                    track,
+                    TRACK_LABELS[track],
+                    False,
+                    explanation="No valid current assessment is stored for this track.",
+                )
+            )
+            continue
+        matched = {skill_key(name) for name in assessment.matched_skills}
+        panels.append(
+            TrackAssessmentView(
+                track=track,
+                label=TRACK_LABELS[track],
+                available=True,
+                score=assessment.score,
+                status=assessment.status,
+                evidence=round(100 * assessment.evidence_coverage),
+                matched_required=[name for name in required if skill_key(name) in matched],
+                missing_required=list(assessment.missing_required_skills),
+                preferred_skills=preferred,
+                matched_preferred=[name for name in preferred if skill_key(name) in matched],
+                projects=list(assessment.relevant_projects),
+                internships=list(assessment.relevant_internships),
+                experience=list(assessment.relevant_experience),
+                explanation=assessment.explanation,
+                unscored_reason=assessment.unscored_reason,
+                resume=assessment.recommended_resume,
+            )
+        )
+    available = sum(panel.available for panel in panels)
+    complete = available == len(TRACK_NAMES)
+    return TrackAssessmentSet(
+        "current" if complete else "partial",
+        active_version,
+        stored,
+        "" if complete else f"Only {available} of {len(TRACK_NAMES)} current results are valid.",
+        panels,
+        _eligibility_view(current[0]),
+    )
 
 
 def _facts(job: Job, posting: JobPosting | None) -> list[tuple[str, str]]:
@@ -643,18 +1441,63 @@ def job_detail(
     weights: dict[str, float] | None = None,
     profile: dict[str, Any] | None = None,
     settings: Settings | None = None,
+    track_version: str | None = None,
+    candidate_id: str | None = None,
 ) -> Detail | None:
     job = repo.get_job(job_id)
     if job is None:
         return None
+
+    app: CandidateApplication | None = None
+    cand_assessments: list[CandidateJobAssessment] = []
+    historical: CandidateHistoricalAssessment | None = None
+    primary_cand_assessment: CandidateJobAssessment | None = None
+
+    if candidate_id:
+        ctx_data = repo.get_job_with_candidate_context(job_id, candidate_id)
+        if ctx_data:
+            app = ctx_data.get("application")
+            cand_assessments = ctx_data.get("assessments", [])
+            historical = ctx_data.get("historical_assessment")
+            if cand_assessments:
+                if track_version:
+                    matched = [
+                        a for a in cand_assessments if str(a.profile_version) == str(track_version)
+                    ]
+                    primary_cand_assessment = matched[0] if matched else cand_assessments[0]
+                else:
+                    primary_cand_assessment = cand_assessments[0]
+
     draft = None
-    if settings is not None and job.status == JobStatus.APPLIED.value:
+    app_is_applied = app is not None and app.status == CandidateApplicationStatus.APPLIED.value
+    legacy_is_applied = app is None and job.status == JobStatus.APPLIED.value
+    if settings is not None and (app_is_applied or legacy_is_applied):
         draft = FollowUpReminder(settings, repo, TaskQueue(repo)).draft_for(job)
     posting = posting_of(job)
     page = repo.get_page(job.id)
     apply_url = posting.apply_url if posting else None
+
+    # Status history: candidate-scoped if candidate_id and candidate has history, else legacy
+    if candidate_id:
+        cand_hist = repo.list_candidate_application_history(candidate_id, job_id=job.id)
+        if cand_hist:
+            history = [(candidate_label(h.status), when(h.changed_at, tz)) for h in cand_hist]
+        else:
+            history = []
+    else:
+        history = [(label(st), when(at, tz)) for st, at in repo.status_history(job.id)]
+
+    card_obj = card(
+        job,
+        tz,
+        now,
+        application=app,
+        candidate_assessment=primary_cand_assessment,
+        historical_assessment=historical,
+    )
+
     return Detail(
-        card=card(job, tz, now),
+        card=card_obj,
         take=take(split_reason(job.score_reason, posting)),
         breakdown=breakdown(repo.latest_match(job.id), weights or {}),
         url=job.canonical_url,
@@ -668,11 +1511,20 @@ def job_detail(
             Seen(source_label(s), when(s.posted_at, tz), message_link(s))
             for s in repo.job_sightings(job.id)
         ],
-        history=[(label(st), when(at, tz)) for st, at in repo.status_history(job.id)],
+        history=history,
         files=[_file(a, tz, settings) for a in repo.artifacts_of(job.id)],
         building=repo.task_waiting(BUILD_RESUME, job.id),
         draft=draft,
         page_text=page.text if page and page.text else None,
+        track_assessments=track_assessment_set(
+            cand_assessments if cand_assessments else repo.track_matches_for_job(job.id),
+            str(cand_assessments[0].profile_version) if cand_assessments else track_version,
+            posting,
+        ),
+        lead=lead_panel(repo.get_job_lead(job.id), track_version, tz),
+        candidate_application=app,
+        historical_assessment=historical,
+        candidate_assessments=cand_assessments,
     )
 
 
@@ -872,9 +1724,9 @@ class SourceStrip:
     rows: list[tuple[SourceRow, list[tuple[Card, Application]]]]  # each row with its jobs
 
 
-def source_strip(repo: Repo, tz: ZoneInfo) -> SourceStrip | None:
+def source_strip(repo: Repo, tz: ZoneInfo, candidate_id: str | None = None) -> SourceStrip | None:
     """None until you've applied to something."""
-    report = by_source(repo)
+    report = by_source(repo, candidate_id=candidate_id)
     if not report.rows:
         return None
     cards: dict[str, Card] = {}

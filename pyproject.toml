@@ -71,7 +71,7 @@ packages = ["src/jobradar"]
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
-extend-exclude = ["docs"]
+extend-exclude = ["docs", "scripts/diagnostics"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "ASYNC", "S"]

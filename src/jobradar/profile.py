@@ -10,12 +10,197 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from jobradar.config import ConfigError, FiltersConfig, MatchingConfig
 from jobradar.pipeline.dedupe import sha1
+
+TrackName = Literal["ai_backend", "full_stack", "sde", "sdet"]
+EvidenceStatus = Literal[
+    "resume_supported",
+    "user_confirmed",
+    "independently_verified",
+    "unverified",
+    "rejected",
+]
+EvidenceCategory = Literal[
+    "education",
+    "skill",
+    "experience",
+    "project",
+    "metric",
+    "preference",
+    "public_profile",
+]
+EvidencePurpose = Literal["matching", "resume"]
+
+TRACK_NAMES: tuple[TrackName, ...] = ("ai_backend", "full_stack", "sde", "sdet")
+APPROVED_EVIDENCE = frozenset({"resume_supported", "user_confirmed", "independently_verified"})
+INDEPENDENT_SOURCE_KINDS = frozenset({"document", "repository", "test"})
+
+
+class _ExtensionModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class EvidenceSource(_ExtensionModel):
+    kind: Literal["resume", "user", "document", "repository", "test"]
+    file: str | None = None
+    sha256: str | None = Field(default=None, pattern=r"^[0-9A-Fa-f]{64}$")
+    view: Literal["overall", "ai_backend", "full_stack", "sde", "sdet"] | None = None
+
+    @model_validator(mode="after")
+    def _resume_has_a_file(self) -> EvidenceSource:
+        if self.kind == "resume" and not self.file:
+            raise ValueError("a resume evidence source requires file")
+        return self
+
+
+class EvidenceFact(_ExtensionModel):
+    value: Any
+    status: EvidenceStatus
+    category: EvidenceCategory
+    sources: list[str] = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+    resume_safe: bool = False
+    note: str | None = None
+
+    @model_validator(mode="after")
+    def _unsafe_status_is_not_resume_safe(self) -> EvidenceFact:
+        if self.status in ("unverified", "rejected") and self.resume_safe:
+            raise ValueError(f"{self.status} evidence cannot be resume_safe")
+        return self
+
+
+class EvidenceSection(_ExtensionModel):
+    sources: dict[str, EvidenceSource] = Field(min_length=1)
+    facts: dict[str, EvidenceFact] = Field(default_factory=dict)
+
+
+class CareerTrack(_ExtensionModel):
+    label: str = Field(min_length=1, max_length=80)
+    resume: str = Field(min_length=1)
+    target_roles: list[str] = Field(min_length=1)
+    fact_refs: list[str] = Field(default_factory=list)
+
+
+def _validation_message(error: ValidationError) -> str:
+    parts = []
+    for issue in error.errors(include_url=False, include_input=False):
+        place = ".".join(str(p) for p in issue["loc"])
+        parts.append(f"{place}: {issue['msg']}" if place else str(issue["msg"]))
+    return "; ".join(parts)
+
+
+def profile_extensions(
+    profile: dict[str, Any],
+) -> tuple[EvidenceSection, dict[TrackName, CareerTrack]] | None:
+    """Validate the optional evidence-backed four-view profile extension.
+
+    Profiles without either section are legacy profiles and remain valid. Once one section is
+    present, both are required so a fact can never be selected without its evidence record.
+    """
+    evidence_raw = profile.get("evidence")
+    tracks_raw = profile.get("career_tracks")
+    if evidence_raw is None and tracks_raw is None:
+        return None
+    if evidence_raw is None or tracks_raw is None:
+        raise ConfigError("profile evidence and career_tracks must be configured together")
+    try:
+        evidence = EvidenceSection.model_validate(evidence_raw)
+        if not isinstance(tracks_raw, dict):
+            raise ConfigError("profile career_tracks must be a mapping")
+        tracks = {
+            str(name): CareerTrack.model_validate(value) for name, value in tracks_raw.items()
+        }
+    except ValidationError as e:
+        raise ConfigError("profile evidence is invalid: " + _validation_message(e)) from None
+
+    expected = set(TRACK_NAMES)
+    found = set(tracks)
+    if found != expected:
+        missing, extra = sorted(expected - found), sorted(found - expected)
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if extra:
+            details.append("unknown " + ", ".join(extra))
+        raise ConfigError(
+            "profile career_tracks must define exactly four views: " + "; ".join(details)
+        )
+
+    for fact_id, fact in evidence.facts.items():
+        unknown = sorted(set(fact.sources) - set(evidence.sources))
+        if unknown:
+            raise ConfigError(f"profile evidence fact {fact_id!r} has unknown sources: {unknown}")
+        source_kinds = {evidence.sources[source].kind for source in fact.sources}
+        if fact.status == "resume_supported" and "resume" not in source_kinds:
+            raise ConfigError(
+                f"profile evidence fact {fact_id!r} is resume_supported but has no resume source"
+            )
+        if fact.status == "user_confirmed" and "user" not in source_kinds:
+            raise ConfigError(
+                f"profile evidence fact {fact_id!r} is user_confirmed but has no user source"
+            )
+        if fact.status == "independently_verified" and not (
+            source_kinds & INDEPENDENT_SOURCE_KINDS
+        ):
+            raise ConfigError(
+                f"profile evidence fact {fact_id!r} is independently_verified but has no "
+                "independent source; repeated resume claims are not independent verification"
+            )
+    typed: dict[TrackName, CareerTrack] = {}
+    for name in TRACK_NAMES:
+        track = tracks[name]
+        source = evidence.sources.get(track.resume)
+        if source is None:
+            raise ConfigError(
+                f"profile career_tracks.{name}.resume has unknown source {track.resume!r}"
+            )
+        if source.kind != "resume":
+            raise ConfigError(f"profile career_tracks.{name}.resume must refer to a resume source")
+        unknown = sorted(set(track.fact_refs) - set(evidence.facts))
+        if unknown:
+            raise ConfigError(f"profile career_tracks.{name} has unknown fact_refs: {unknown}")
+        typed[name] = track
+    return evidence, typed
+
+
+def evidence_is_approved(fact: EvidenceFact, purpose: EvidencePurpose = "matching") -> bool:
+    """Whether a fact may enter a derived view for matching or resume generation."""
+    if fact.status not in APPROVED_EVIDENCE:
+        return False
+    return purpose == "matching" or fact.resume_safe
+
+
+def candidate_views(
+    profile: dict[str, Any], purpose: EvidencePurpose = "matching"
+) -> dict[TrackName, dict[str, Any]]:
+    """Four evidence-backed views; an empty mapping for an unchanged legacy profile."""
+    extensions = profile_extensions(profile)
+    if extensions is None:
+        return {}
+    evidence, tracks = extensions
+    views: dict[TrackName, dict[str, Any]] = {}
+    for name in TRACK_NAMES:
+        track = tracks[name]
+        facts = {
+            fact_id: evidence.facts[fact_id].model_dump(mode="json")
+            for fact_id in track.fact_refs
+            if evidence_is_approved(evidence.facts[fact_id], purpose)
+        }
+        views[name] = {
+            "track": name,
+            "label": track.label,
+            "resume": track.resume,
+            "resume_source": evidence.sources[track.resume].model_dump(mode="json"),
+            "target_roles": list(track.target_roles),
+            "facts": facts,
+        }
+    return views
 
 
 def load_profile(path: Path) -> dict[str, Any]:
@@ -30,6 +215,7 @@ def load_profile(path: Path) -> dict[str, Any]:
         raise ConfigError(f"{path} is not valid YAML: {e}") from None
     if not isinstance(raw, dict):
         raise ConfigError(f"{path} must be a mapping (basics:, education:, skills:, ...).")
+    profile_extensions(raw)
     return raw
 
 

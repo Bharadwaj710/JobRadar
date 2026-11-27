@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -149,7 +150,22 @@ class BoardsConfig(_Strict):
     """Company job boards checked directly, so new postings arrive before channels repost them."""
 
     enabled: bool = True
+    candidate_independent: bool = Field(
+        default=False,
+        description="Preserve multi-candidate inventory across seniorities, tracks, and locations.",
+    )
     every_minutes: int = Field(default=20, ge=5, le=240)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _env_override_candidate_independent(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "candidate_independent" not in data:
+            env_val = os.environ.get("JOBRADAR_CANDIDATE_INDEPENDENT")
+            if env_val is not None:
+                data["candidate_independent"] = env_val.lower() in ("1", "true", "yes")
+        return data
+
+    max_new_per_check: int = Field(default=10, ge=1, le=200)
     # One section per hiring system: `Name: board name` (or a link to that board). A plain
     # list of board names also works, e.g. `greenhouse: [stripe, rubrik]`.
     greenhouse: dict[str, str] | list[str] = Field(default_factory=dict)
@@ -318,7 +334,21 @@ class MatchingConfig(_Strict):
     """How jobs are matched against config/profile.yaml (see docs/LLD.md, match.py)."""
 
     enabled: bool = True
+    candidate_independent: bool = Field(
+        default=False,
+        description="When true, owner eligibility does not hide shared jobs.",
+    )
     profile_path: Path = Path("config/profile.yaml")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _env_override_candidate_independent(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "candidate_independent" not in data:
+            env_val = os.environ.get("JOBRADAR_CANDIDATE_INDEPENDENT")
+            if env_val is not None:
+                data["candidate_independent"] = env_val.lower() in ("1", "true", "yes")
+        return data
+
     # Tried in order; the first that answers wins. skills_rule needs no key but never alerts.
     providers: list[MatchProviderName] = Field(
         default_factory=lambda: ["llm", "skills_rule"]  # type: ignore[arg-type]
@@ -492,6 +522,10 @@ class NotionConfig(_Strict):
 class AppConfig(_Strict):
     """Everything in config.yaml. Every section is optional and has defaults."""
 
+    owner_candidate_id: str | None = Field(
+        default=None,
+        description="Explicit candidate ID representing the workspace owner.",
+    )
     sources: SourcesConfig = Field(default_factory=SourcesConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     filters: FiltersConfig = Field(default_factory=FiltersConfig)
@@ -504,6 +538,15 @@ class AppConfig(_Strict):
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     web: WebConfig = Field(default_factory=WebConfig)
     notion: NotionConfig = Field(default_factory=NotionConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _env_override_owner_candidate_id(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "owner_candidate_id" not in data:
+            env_val = os.environ.get("JOBRADAR_OWNER_CANDIDATE_ID")
+            if env_val and env_val.strip():
+                data["owner_candidate_id"] = env_val.strip()
+        return data
 
     @model_validator(mode="after")
     def _telegram_has_chats(self) -> AppConfig:

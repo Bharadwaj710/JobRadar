@@ -168,6 +168,11 @@ def job_card(
     compact: bool = False,
     actions: list[tuple[str, str]] | None = None,
     dashboard: str | None = None,
+    score: int | None = None,
+    score_override: bool = False,
+    is_legacy: bool = False,
+    historical_score: int | None = None,
+    explanation: str | None = None,
 ) -> tuple[str, str]:
     """(html, text) for one job. `actions`: (label, mailto link) buttons under the others;
     `dashboard`: the dashboard's address, for a link to the job's page there."""
@@ -180,10 +185,21 @@ def job_card(
         reason.place or (posting.locations[0] if posting and posting.locations else ""),
     ]
     sub = " · ".join(w for w in where if w)
-    bg, fg = score_colors(job.score)
-    score = "\u2013" if job.score is None else str(job.score)
+
+    if score_override or score is not None:
+        active_score = score
+    elif historical_score is not None:
+        active_score = historical_score
+        is_legacy = True
+    else:
+        active_score = job.score
+
+    bg, fg = score_colors(active_score)
+    score_str = "\u2013" if active_score is None else str(active_score)
 
     chips = []
+    if is_legacy:
+        chips.append(chip("legacy_matcher", POOR))
     if reason.unsure:
         chips.append(chip("Unsure", POOR))
     if reason.fit:
@@ -212,6 +228,12 @@ def job_card(
         chips.append(chip(age, POOR if age.startswith("Old") else ("#eef1f5", MUTED)))
 
     skill_rows = ""
+    if explanation:
+        skill_rows += (
+            f"<div style='font-size:13px;color:{INK};margin:4px 0 0'>"
+            f"<span style='color:{MUTED};font-weight:600'>Match:</span>&nbsp; "
+            f"{esc(explanation)}</div>"
+        )
     if reason.have:
         skill_rows += (
             f"<div style='font-size:13px;color:{INK};margin:4px 0 0'>"
@@ -243,7 +265,7 @@ def job_card(
 <table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:{CARD};border:1px solid {LINE};border-radius:12px'>
 <tr>
 <td width='{tile + 20}' valign='top' style='padding:16px 0 16px 16px'>
-<div style='width:{tile}px;height:{tile}px;line-height:{tile}px;border-radius:10px;background:{bg};color:{fg};font-size:{20 if compact else 22}px;font-weight:700;text-align:center'>{score}</div>
+<div style='width:{tile}px;height:{tile}px;line-height:{tile}px;border-radius:10px;background:{bg};color:{fg};font-size:{20 if compact else 22}px;font-weight:700;text-align:center'>{score_str}</div>
 </td>
 <td valign='top' style='padding:16px 16px 16px 14px'>
 <div style='font-size:{16 if compact else 17}px;font-weight:700;color:{INK};line-height:1.3'>{esc(role)}</div>
@@ -254,7 +276,10 @@ def job_card(
 </td></tr></table>
 </td></tr>"""
 
-    text = [f"{score}  {role}" + (f" — {sub}" if sub else "")]
+    plain_score = f"{score_str} (legacy_matcher)" if is_legacy else score_str
+    text = [f"{plain_score}  {role}" + (f" — {sub}" if sub else "")]
+    if explanation:
+        text.append(f"    Match: {explanation}")
     meta = [
         m
         for m in (reason.fit, reason.eligibility, seen, f"closes {closes}" if closes else "", age)

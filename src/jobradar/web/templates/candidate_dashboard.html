@@ -1,0 +1,295 @@
+{% extends "base.html" %}
+{% from "_macros.html" import ring with context %}
+{% block title %}Candidate Dashboard · JobRadar{% endblock %}
+
+{% block main %}
+<div class="head" style="margin-bottom: 24px;">
+  <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
+    <div>
+      <h1 style="font-size: 28px; font-weight: 800; letter-spacing: -0.025em; margin: 0 0 6px;">
+        Personalized Match Radar
+      </h1>
+      <p class="lede" style="margin: 0; color: var(--muted); font-size: 14.5px;">
+        Welcome back, <strong>{{ candidate.name }}</strong> ({{ candidate.email }}).
+        {% if active_profile %}
+          Active Profile: <span class="badge hot" style="vertical-align: middle; margin-left: 4px;">Version {{ active_profile.version }}</span>
+        {% endif %}
+      </p>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+      {% if active_profile %}
+        <form method="post" action="/candidate/refresh" style="margin: 0;">
+          <input type="hidden" name="token" value="{{ csrf_token }}">
+          <button type="submit" class="btn-secondary-saas" style="cursor: pointer;">
+            ↻ Refresh Assessments
+          </button>
+        </form>
+        <a href="/onboarding/review/{{ active_profile.id }}" class="btn-secondary-saas">
+          Review Profile
+        </a>
+      {% else %}
+        <a href="/onboarding" class="btn-primary-saas">
+          Set Up Profile &rarr;
+        </a>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if refreshed %}
+<div class="notice" style="background: var(--good-soft); color: var(--good); border: 1px solid var(--good-border); margin-bottom: 20px; padding: 12px 16px; border-radius: 10px; display: flex; align-items: center; gap: 8px;">
+  <svg class="i xs"><use href="#i-check"/></svg>
+  <span><strong>Assessments Refreshed!</strong> Evaluated candidate profile against active job inventory.</span>
+</div>
+{% endif %}
+
+{% if not active_profile %}
+<div class="card-saas" style="padding: 44px 24px; text-align: center; margin-bottom: 24px;">
+  <div style="width: 56px; height: 56px; border-radius: 50%; background: var(--raise); border: 1px solid var(--line); display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;">
+    <svg class="i" style="width: 28px; height: 28px; color: var(--muted);"><use href="#i-file"/></svg>
+  </div>
+  <h2 style="font-size: 20px; font-weight: 800; margin: 0 0 8px; color: var(--ink); text-transform: none;">No Confirmed Profile Active</h2>
+  <p style="color: var(--muted); max-width: 540px; margin: 0 auto 20px; font-size: 14.5px; line-height: 1.5;">
+    Confirm your candidate profile to generate personalized J4 eligibility checks and four-track technical assessments across all active jobs.
+  </p>
+  {% if draft_profile %}
+    <a href="/onboarding/review/{{ draft_profile.id }}" class="btn-primary-saas">
+      Review Existing Draft (v{{ draft_profile.version }}) &rarr;
+    </a>
+  {% else %}
+    <a href="/onboarding" class="btn-primary-saas">
+      Upload Resume to Begin &rarr;
+    </a>
+  {% endif %}
+</div>
+{% else %}
+
+{# Summary Statistics (Gentelella & Vercel hybrid) #}
+<div class="stat-grid-saas" aria-label="Candidate assessment summary">
+  <div class="stat-tile-saas">
+    <span class="stat-tile-val">{{ stats.total }}</span>
+    <span class="stat-tile-label">Total Evaluated</span>
+  </div>
+  <div class="stat-tile-saas eligible">
+    <span class="stat-tile-val">{{ stats.eligible }}</span>
+    <span class="stat-tile-label">Eligible</span>
+  </div>
+  <div class="stat-tile-saas likely">
+    <span class="stat-tile-val">{{ stats.likely_eligible }}</span>
+    <span class="stat-tile-label">Likely Eligible</span>
+  </div>
+  <div class="stat-tile-saas verify">
+    <span class="stat-tile-val">{{ stats.needs_verification }}</span>
+    <span class="stat-tile-label">Verification</span>
+  </div>
+  <div class="stat-tile-saas ineligible">
+    <span class="stat-tile-val">{{ stats.not_eligible }}</span>
+    <span class="stat-tile-label">Ineligible</span>
+  </div>
+  <div class="stat-tile-saas">
+    <span class="stat-tile-val">{{ app_counts.total }}</span>
+    <span class="stat-tile-label">Tracked Apps</span>
+  </div>
+</div>
+
+{# Filter Controls #}
+<div class="card-saas" style="padding: 14px 18px; margin-bottom: 24px;">
+  <form method="get" action="/candidate/dashboard" style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px;">
+    <div class="filter-toolbar-saas">
+      <label class="filter-control-group">
+        <span>Career Track:</span>
+        <select name="track" onchange="this.form.submit()">
+          <option value="" {% if not selected_track %}selected{% endif %}>All Tracks (Best Fit)</option>
+          <option value="ai_backend" {% if selected_track == 'ai_backend' %}selected{% endif %}>AI / Backend</option>
+          <option value="full_stack" {% if selected_track == 'full_stack' %}selected{% endif %}>Full Stack</option>
+          <option value="sde" {% if selected_track == 'sde' %}selected{% endif %}>SDE / General</option>
+          <option value="sdet" {% if selected_track == 'sdet' %}selected{% endif %}>SDET / QA</option>
+        </select>
+      </label>
+
+      <label class="filter-control-group">
+        <span>Eligibility:</span>
+        <select name="eligibility" onchange="this.form.submit()">
+          <option value="" {% if not selected_eligibility %}selected{% endif %}>Recommended Opportunities</option>
+          <option value="eligible" {% if selected_eligibility == 'eligible' %}selected{% endif %}>Eligible &amp; Likely Eligible</option>
+          <option value="needs_verification" {% if selected_eligibility == 'needs_verification' %}selected{% endif %}>Needs Verification Only</option>
+          <option value="not_eligible" {% if selected_eligibility == 'not_eligible' %}selected{% endif %}>Ineligible Roles (Transparency Log)</option>
+          <option value="all" {% if selected_eligibility == 'all' %}selected{% endif %}>All Evaluated Roles</option>
+        </select>
+      </label>
+    </div>
+
+    <div style="font-size: 13px; color: var(--muted); font-weight: 500;">
+      Showing <strong>{{ recommendations | length }}</strong> personalized recommendation{{ '' if recommendations | length == 1 else 's' }}
+    </div>
+  </form>
+</div>
+
+{# Card Rendering Macro #}
+{% macro render_rec_card(item) %}
+  <li class="row card-saas" style="padding: 18px 20px; display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center;">
+    {# Avatar #}
+    <span class="avatar hue-{{ hue(item.company) }}" style="width: 46px; height: 46px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-weight: 750; font-size: 15px; background: var(--raise); color: var(--ink); border: 1px solid var(--line);">
+      {{ initials(item.company) }}
+    </span>
+
+    {# Job Information #}
+    <div style="min-width: 0;">
+      <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px;">
+        <a href="/candidate/jobs/{{ item.job_id }}" class="row-title" style="font-weight: 750; font-size: 16.5px; color: var(--ink); text-decoration: none; letter-spacing: -0.01em;">
+          {{ item.title }}
+        </a>
+        <span class="track-pill track-{{ item.track }}">
+          {{ item.track | replace('_', ' ') }}
+        </span>
+        {% if item.application_status %}
+          <span class="badge hot" style="font-size: 11px; text-transform: capitalize; padding: 3px 8px;">
+            {{ item.application_status }}
+          </span>
+        {% endif %}
+      </div>
+
+      <p style="margin: 0 0 10px; font-size: 13.5px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; align-items: center;">
+        <strong style="color: var(--ink);">{{ item.company }}</strong>
+        <span>📍 {{ item.location }}</span>
+        {% if item.apply_url and item.apply_url != '#' %}
+          <a href="{{ item.apply_url }}" target="_blank" rel="noopener noreferrer" style="color: var(--brand-blue); text-decoration: none; font-weight: 500;">Direct Apply ↗</a>
+        {% endif %}
+      </p>
+
+      {# Skills, Coverage, and Eligibility Summary #}
+      <div style="display: flex; flex-wrap: wrap; gap: 6px; align-items: center;">
+        {% if item.eligibility_status == 'ELIGIBLE' %}
+          <span class="badge-eligibility eligible">ELIGIBLE</span>
+        {% elif item.eligibility_status == 'LIKELY_ELIGIBLE' %}
+          <span class="badge-eligibility likely">LIKELY ELIGIBLE</span>
+        {% elif item.eligibility_status == 'NEEDS_VERIFICATION' %}
+          <span class="badge-eligibility verify">NEEDS VERIFICATION</span>
+        {% else %}
+          <span class="badge-eligibility ineligible">NOT ELIGIBLE</span>
+        {% endif %}
+
+        {% if item.evidence_coverage is not none %}
+          <span class="badge" style="background: var(--brand-blue-soft); color: var(--brand-blue); border: 1px solid var(--line); font-size: 11.5px; font-weight: 600;">
+            {{ (item.evidence_coverage * 100) | round | int }}% Evidence
+          </span>
+        {% endif %}
+
+        {% for s in item.matched_skills[:3] %}
+          <span class="badge" style="background: var(--good-soft); color: var(--good); border: 1px solid var(--good-border); font-size: 11.5px;">✓ {{ s }}</span>
+        {% endfor %}
+
+        {% for s in item.missing_required_skills[:2] %}
+          <span class="badge" style="background: var(--bad-soft); color: var(--bad); border: 1px solid var(--bad-border); font-size: 11.5px;">✕ {{ s }}</span>
+        {% endfor %}
+
+        {% if item.eligibility_reasons %}
+          {% for r in item.eligibility_reasons[:2] %}
+            <span class="badge" style="background: var(--fair-soft); color: var(--fair); border: 1px solid var(--fair-border); font-size: 11.5px; display: inline-flex; align-items: center; gap: 4px;">
+              ⚠️ {{ r }}
+            </span>
+          {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+
+    {# Score & Action #}
+    <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 8px;">
+      <div style="display: flex; flex-direction: column; align-items: center; gap: 2px;">
+        {{ ring(item.technical_score) }}
+        <span style="font-size: 11px; color: var(--muted); font-weight: 600;">
+          {% if item.technical_score is not none %}{{ item.technical_score }}% Fit{% else %}Unscored{% endif %}
+        </span>
+      </div>
+      <a href="/candidate/jobs/{{ item.job_id }}" class="btn-secondary-saas" style="padding: 6px 14px; font-size: 12.5px;">
+        Inspect Fit &rarr;
+      </a>
+    </div>
+  </li>
+{% endmacro %}
+
+{# Recommendations Presentation #}
+{% if not recommendations %}
+<div class="card-saas" style="padding: 48px 20px; text-align: center;">
+  <div style="width: 48px; height: 48px; border-radius: 50%; background: var(--raise); display: flex; align-items: center; justify-content: center; margin: 0 auto 14px;">
+    <svg class="i" style="color: var(--faint);"><use href="#i-search"/></svg>
+  </div>
+  <p style="color: var(--muted); margin: 0; font-size: 15px;">
+    No job recommendations match your selected filters. Try switching track or clearing eligibility filters.
+  </p>
+</div>
+{% else %}
+
+  {# 1. Confirmed Matches (Eligible & Likely Eligible) #}
+  {% if eligible_recs %}
+    <div style="margin-bottom: 28px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <h2 style="font-size: 18px; font-weight: 750; margin: 0; color: var(--ink); display: flex; align-items: center; gap: 8px;">
+          <span>Confirmed Matches</span>
+          <span class="badge" style="background: var(--good-soft); color: var(--good); border: 1px solid var(--good-border); font-size: 12px; font-weight: 700;">
+            {{ eligible_recs | length }}
+          </span>
+        </h2>
+        <span style="font-size: 12.5px; color: var(--muted);">Confirmed eligible against your profile requirements</span>
+      </div>
+      <ul class="rows" style="list-style: none; margin: 0; padding: 0; display: grid; gap: 12px;">
+        {% for item in eligible_recs %}
+          {{ render_rec_card(item) }}
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {# 2. Opportunities Pending Verification #}
+  {% if verification_recs %}
+    <div style="margin-bottom: 28px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <h2 style="font-size: 18px; font-weight: 750; margin: 0; color: var(--ink); display: flex; align-items: center; gap: 8px;">
+          <span>Opportunities Pending Verification</span>
+          <span class="badge" style="background: var(--fair-soft); color: var(--fair); border: 1px solid var(--fair-border); font-size: 12px; font-weight: 700;">
+            {{ verification_recs | length }}
+          </span>
+        </h2>
+        <span style="font-size: 12.5px; color: var(--muted);">High skill fit with unspecified employer requirements</span>
+      </div>
+      <div class="callout-banner" style="background: var(--fair-soft); border: 1px solid var(--fair-border); border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; font-size: 13.5px; color: var(--ink); line-height: 1.5; display: flex; align-items: flex-start; gap: 10px;">
+        <span style="font-size: 16px; line-height: 1; color: var(--fair);">⚠️</span>
+        <div>
+          <strong style="color: var(--fair);">Requirements Unspecified:</strong> These roles strongly align with your technical skillset, but graduation batch or specific criteria are unstated in the posting. Verify details directly before applying.
+        </div>
+      </div>
+      <ul class="rows" style="list-style: none; margin: 0; padding: 0; display: grid; gap: 12px;">
+        {% for item in verification_recs %}
+          {{ render_rec_card(item) }}
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+  {# 3. Ineligible Roles (Transparency Log) #}
+  {% if ineligible_recs %}
+    <div style="margin-bottom: 28px;">
+      <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+        <h2 style="font-size: 18px; font-weight: 750; margin: 0; color: var(--ink); display: flex; align-items: center; gap: 8px;">
+          <span>Ineligible Roles (Transparency Log)</span>
+          <span class="badge" style="background: var(--bad-soft); color: var(--bad); border: 1px solid var(--bad-border); font-size: 12px; font-weight: 700;">
+            {{ ineligible_recs | length }}
+          </span>
+        </h2>
+        <span style="font-size: 12.5px; color: var(--muted);">Excluded by hard constraints or explicit policy</span>
+      </div>
+      <div class="callout-banner" style="background: var(--raise); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin-bottom: 14px; font-size: 13.5px; color: var(--muted); line-height: 1.5;">
+        These roles have been evaluated and confirmed not eligible based on hard constraints (e.g. experience requirement exceeding profile, branch restriction, or explicit graduation batch exclusions). Preserved here for full transparency.
+      </div>
+      <ul class="rows" style="list-style: none; margin: 0; padding: 0; display: grid; gap: 12px;">
+        {% for item in ineligible_recs %}
+          {{ render_rec_card(item) }}
+        {% endfor %}
+      </ul>
+    </div>
+  {% endif %}
+
+{% endif %}
+
+{% endif %}
+{% endblock %}

@@ -209,11 +209,10 @@ class PageWatcher:
             await self._reread(url)
 
     async def _reread(self, url: str) -> None:
-        """The page itself is the job: read it again so Notion shows what changed. A job you
-        moved in Notion is left alone."""
+        """The page itself is the job: read it again so Notion shows what changed."""
         canonical = await canonicalise(url)
         job = self.repo.get_job(job_id_for_url(canonical)) if canonical else None
-        if job is None or job.user_status_at is not None:
+        if job is None:
             return  # a new job is fetched by ingest anyway
         if job.status in (JobStatus.HIDDEN, JobStatus.DISCARDED):
             self.repo.set_job_status(job.id, JobStatus.DISCOVERED, "page updated")

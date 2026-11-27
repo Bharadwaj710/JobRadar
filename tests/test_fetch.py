@@ -117,3 +117,60 @@ async def test_javascript_page_reads_its_jobposting_description() -> None:
     page = await fetcher().fetch("https://acme.com/job/1")
     assert page.text == "Minimum 5 year(s) of experience is required. Java and Spring."
     assert page.note is None
+
+
+@respx.mock
+async def test_reads_greenhouse_official_job_detail() -> None:
+    api = "https://boards-api.greenhouse.io/v1/boards/hackerrank/jobs/8229735"
+    official = "https://job-boards.greenhouse.io/hackerrank/jobs/8229735"
+    content = "<h2>Required qualifications</h2><p>Python or Java and SQL.</p>"
+    respx.get("https://boards-api.greenhouse.io/robots.txt").respond(404)
+    respx.get(api).respond(
+        200,
+        json={
+            "id": 8229735,
+            "title": "Software Development Engineer Intern",
+            "location": {"name": "Bengaluru, India"},
+            "absolute_url": official,
+            "content": content,
+            "first_published": "2026-11-03T10:00:00-05:00",
+        },
+    )
+
+    page = await fetcher().fetch_greenhouse_detail("hackerrank", "8229735", official)
+
+    assert page.final_url == official
+    assert page.title == "Software Development Engineer Intern"
+    assert page.text == "Required qualifications\nPython or Java and SQL."
+    assert page.note is None
+    assert page.structured == {
+        "@type": "JobPosting",
+        "title": "Software Development Engineer Intern",
+        "description": content,
+        "jobLocation": {"address": {"addressLocality": "Bengaluru, India"}},
+        "datePosted": "2026-11-03T10:00:00-05:00",
+    }
+
+
+@respx.mock
+async def test_greenhouse_detail_temporary_failure_is_retryable() -> None:
+    api = "https://boards-api.greenhouse.io/v1/boards/rubrik/jobs/8166537"
+    respx.get("https://boards-api.greenhouse.io/robots.txt").respond(404)
+    respx.get(api).respond(503)
+
+    try:
+        await fetcher().fetch_greenhouse_detail("rubrik", "8166537", "https://rubrik.com/job")
+    except RetryableError as error:
+        assert error.status == 503
+    else:
+        raise AssertionError("expected a retry")
+
+
+@respx.mock
+async def test_greenhouse_detail_rejects_unsafe_identifiers_without_a_request() -> None:
+    page = await fetcher().fetch_greenhouse_detail(
+        "../private", "not-an-id", "https://job-boards.greenhouse.io/acme/jobs/1"
+    )
+
+    assert page.note == "invalid Greenhouse posting reference"
+    assert not respx.calls

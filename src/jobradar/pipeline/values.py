@@ -73,16 +73,25 @@ _EXP_AFTER = re.compile(
     r"(?:years?|yrs?|months?))",
     re.IGNORECASE,
 )
+_PREFERRED_EXPERIENCE = re.compile(
+    r"\b(preferred|preferably|nice to have|good to have|plus|desirable|advantage|bonus)\b",
+    re.IGNORECASE,
+)
+_EXPERIENCE_SENTENCE = re.compile(r"\n+|(?<=[.!?;])\s+(?=[A-Z0-9])")
 
 
 def experience_in_text(text: str) -> tuple[float | None, float | None]:
     """(min, max) years from a job description, only where a number of years sits next to
-    the word "experience" ("15 years full time education" doesn't count)."""
-    for pattern in (_EXP_BEFORE, _EXP_AFTER):
-        if m := pattern.search(text):
-            lo, hi = parse_experience(m.group(1))
-            if lo is not None:
-                return lo, hi
+    the word "experience" ("15 years full time education" doesn't count). Preferred years
+    are not returned as a mandatory minimum."""
+    for sentence in _EXPERIENCE_SENTENCE.split(text):
+        if _PREFERRED_EXPERIENCE.search(sentence):
+            continue
+        for pattern in (_EXP_BEFORE, _EXP_AFTER):
+            if m := pattern.search(sentence):
+                lo, hi = parse_experience(m.group(1))
+                if lo is not None:
+                    return lo, hi
     return None, None
 
 

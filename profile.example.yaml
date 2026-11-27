@@ -128,6 +128,79 @@ projects:
         text: Stored trips in **SQLite** with migrations, and published it on PyPI.
         tags: [sqlite, packaging]
 
+# Optional additive evidence model. Keep each fact once here; career tracks only reference it.
+# Repeated claims in multiple resumes are still resume_supported, not independently_verified.
+evidence:
+  sources:
+    overall_resume:
+      kind: resume
+      file: D:/Resumes/Resume.pdf
+      view: overall
+    ai_resume:
+      kind: resume
+      file: D:/Resumes/ResumeAI.pdf
+      view: ai_backend
+    full_stack_resume:
+      kind: resume
+      file: D:/Resumes/ResumeFullStack.pdf
+      view: full_stack
+    sdet_resume:
+      kind: resume
+      file: D:/Resumes/ResumeSDET.pdf
+      view: sdet
+    user_confirmation:
+      kind: user
+  facts:
+    skill.python:
+      value: Python
+      status: resume_supported
+      category: skill
+      sources: [overall_resume, ai_resume, sdet_resume]
+      evidence_refs: [intern-example-labs, split-cli]
+      resume_safe: true
+    skill.full_stack:
+      value: [JavaScript, React, Node.js]
+      status: resume_supported
+      category: skill
+      sources: [overall_resume, full_stack_resume]
+      evidence_refs: [campus-events]
+      resume_safe: true
+    preference.remote:
+      value: Remote
+      status: user_confirmed
+      category: preference
+      sources: [user_confirmation]
+      resume_safe: false
+    metric.unverified_example:
+      value: 100+ users
+      status: unverified
+      category: metric
+      sources: [ai_resume, full_stack_resume]
+      evidence_refs: [campus-events]
+      resume_safe: false
+
+career_tracks:
+  ai_backend:
+    label: AI and Python backend
+    resume: ai_resume
+    target_roles: [AI Engineer, Python Backend Engineer]
+    fact_refs: [skill.python, metric.unverified_example]
+  full_stack:
+    label: Full-stack development
+    resume: full_stack_resume
+    target_roles: [Full-Stack Engineer]
+    fact_refs: [skill.python, skill.full_stack, metric.unverified_example]
+  sde:
+    label: General software engineering
+    resume: overall_resume
+    target_roles: [Software Engineer]
+    fact_refs: [skill.python, skill.full_stack, preference.remote]
+  sdet:
+    label: SDET and QA automation
+    resume: sdet_resume
+    target_roles: [SDET]
+    fact_refs: [skill.python]
+
 answers:                  # reused for application forms
   notice_period: Immediate
   expected_ctc: As per company norms

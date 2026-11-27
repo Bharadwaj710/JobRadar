@@ -1,5 +1,7 @@
 # Copy to config/config.yaml. Validated at start-up.
 
+# owner_candidate_id: cand_559be1dd48c2  # optional: explicit owner candidate ID; auto-resolved if omitted
+
 sources:
   telegram:
     enabled: true
@@ -7,6 +9,7 @@ sources:
     backfill_days: 3
   boards:                   # company job boards, read directly: jobs arrive minutes after posting
     enabled: true
+    candidate_independent: true  # multi-candidate platform: preserve all authentic postings across roles/regions
     every_minutes: 20       # each board is read this often (spread out)
     # One section per hiring system: "Name: board name", the last part of the board's
     # address (job-boards.greenhouse.io/stripe -> stripe). A link to the board works too.
@@ -39,7 +42,7 @@ sources:
     enabled: true
     folder: JobRadar      # forward jobs here (Gmail: a label + filter)
     poll_minutes: 2
-  whatsapp: { enabled: false, port: 8765 }   # experimental, unofficial client — ban risk
+  whatsapp: { enabled: false, port: 8765 }   # experimental, unofficial client - ban risk
 
 llm:
   extract_model: "gemini/gemini-flash-lite-latest"  # extraction + scoring (cheap, fast)
@@ -60,6 +63,7 @@ filters:
   exclude_companies: []
 
 matching:
+  candidate_independent: true           # multi-candidate: owner-specific eligibility does not hide shared jobs
   profile_path: config/profile.yaml     # copy profile.example.yaml there and fill it in
   providers: [llm, skills_rule]         # tried in order; skills_rule needs no key, never alerts
   weights:                              # Match Score = 100 x weighted answers; changing these

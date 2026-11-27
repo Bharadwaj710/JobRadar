@@ -298,6 +298,31 @@ def test_readable_board_list() -> None:
     assert json.loads("[]") == []
 
 
+def test_boards_config_candidate_independent_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pathlib import Path
+
+    from jobradar.config import BoardsConfig, load_config
+
+    # 1. Configured config/config.yaml explicitly enables candidate_independent
+    cfg_file = Path("config/config.yaml")
+    if cfg_file.is_file():
+        cfg = load_config(cfg_file)
+        assert cfg.sources.boards.candidate_independent is True
+
+    # 2. Explicit dictionary validation
+    b_explicit = BoardsConfig.model_validate({"candidate_independent": True})
+    assert b_explicit.candidate_independent is True
+
+    # 3. Environment variable override mechanism
+    monkeypatch.setenv("JOBRADAR_CANDIDATE_INDEPENDENT", "true")
+    b_env = BoardsConfig.model_validate({})
+    assert b_env.candidate_independent is True
+
+    monkeypatch.setenv("JOBRADAR_CANDIDATE_INDEPENDENT", "false")
+    b_env_false = BoardsConfig.model_validate({})
+    assert b_env_false.candidate_independent is False
+
+
 @pytest.mark.parametrize(
     ("title", "location", "level", "why"),
     [
@@ -315,6 +340,75 @@ def test_why_skipped(title: str, location: str, level: str | None, why: str | No
     from jobradar.sources.boards.filters import why_skipped
 
     assert why_skipped(title, location, level) == why
+
+
+def test_candidate_independent_ingestion_filters() -> None:
+    from jobradar.sources.boards.filters import why_skipped, worth_a_look
+
+    # Multi-candidate ingestion preserves opportunities across locations, seniority, and tracks
+    assert (
+        why_skipped(
+            "Lead Software Development Engineer",
+            "London, UK",
+            "director",
+            candidate_independent=True,
+        )
+        is None
+    )
+    assert (
+        worth_a_look(
+            "Lead Software Development Engineer",
+            "London, UK",
+            "director",
+            candidate_independent=True,
+        )
+        is True
+    )
+    assert why_skipped("Product Designer", "New York, NY", None, candidate_independent=True) is None
+
+    # Technical safeguard: malformed / empty titles are rejected
+    assert why_skipped("", "Bengaluru", None, candidate_independent=True) == "empty title"
+    assert why_skipped("   ", "Bengaluru", None, candidate_independent=True) == "empty title"
+
+
+@respx.mock
+async def test_board_watcher_candidate_independent_ingestion(
+    repo: Repo, queue: TaskQueue, clock: FakeClock
+) -> None:
+    # Configured with candidate_independent=True
+    cfg = BoardsConfig(companies=[STRIPE], every_minutes=20, candidate_independent=True)
+    inbox = Inbox()
+    w = BoardWatcher(cfg, repo, queue, inbox, httpx.AsyncClient(), clock=clock)
+
+    route = respx.get(GH)
+    route.respond(
+        json={
+            "jobs": [
+                gh_job(101, "Staff Backend Architect", "London, UK"),
+                gh_job(102, "Global Account Executive", "Tokyo, Japan"),
+                gh_job(103, "   ", "Bengaluru, India"),
+            ]
+        }
+    )
+    # Baseline check: records existing, nothing emitted
+    await w.check_board(STRIPE)
+    assert len(inbox.got) == 0
+
+    # Next check: a senior posting in San Francisco appears
+    route.respond(
+        json={
+            "jobs": [
+                gh_job(101, "Staff Backend Architect", "London, UK"),
+                gh_job(102, "Global Account Executive", "Tokyo, Japan"),
+                gh_job(103, "   ", "Bengaluru, India"),
+                gh_job(104, "Director of Engineering", "San Francisco, CA"),
+            ]
+        }
+    )
+    await w.check_board(STRIPE)
+    # Verified: senior role and US location are NOT rejected; passed to inbox
+    assert len(inbox.got) == 1
+    assert inbox.got[0].message_id == "104"
 
 
 @respx.mock

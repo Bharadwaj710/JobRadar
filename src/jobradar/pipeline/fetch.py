@@ -24,14 +24,17 @@ import trafilatura
 
 from jobradar.net import is_public_host
 from jobradar.pipeline import oracle
-from jobradar.pipeline.structured import description_text, find_job_posting
+from jobradar.pipeline.structured import MAX_DESCRIPTION, description_text, find_job_posting
 from jobradar.queue.tasks import RetryableError
 
 log = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) JobRadar/0.2 (+https://github.com/ThePlator/JobRadar)"
 MIN_TEXT = 400  # shorter than this usually means a JavaScript shell
+GREENHOUSE_DETAIL_MIN_TEXT = 2_000
 MAX_HOPS = 5
+_GREENHOUSE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_GREENHOUSE_ID = re.compile(r"^[0-9]{1,30}$")
 
 # Where sites send you when a page needs an account.
 _LOGIN_PATHS = (
@@ -50,6 +53,13 @@ class Page:
     text: str | None  # None when unusable; `note` says why
     note: str | None = None
     structured: dict[str, Any] | None = None  # schema.org JobPosting in the page, if any
+
+
+def needs_greenhouse_detail(page: Page) -> bool:
+    """Whether an employer page is too incomplete to trust over Greenhouse's detail API."""
+    return page.text is None or (
+        page.structured is None and len(page.text) < GREENHOUSE_DETAIL_MIN_TEXT
+    )
 
 
 def _host_path(url: str) -> str:
@@ -131,6 +141,83 @@ class Fetcher:
                 continue
             return await self._read(current, resp, links)
         return Page(current, None, None, "too many redirects")
+
+    async def fetch_greenhouse_detail(self, board: str, posting_id: str, original_url: str) -> Page:
+        """Read one posting from Greenhouse's official public detail API.
+
+        The board and posting identifiers come from a direct board sighting, not from the page
+        URL. Invalid identifiers never become request targets. Temporary failures use the normal
+        task retry path; permanent failures leave the caller free to keep the employer page.
+        """
+        if not _GREENHOUSE_NAME.fullmatch(board) or not _GREENHOUSE_ID.fullmatch(posting_id):
+            return Page(original_url, None, None, "invalid Greenhouse posting reference")
+        host = "boards-api.greenhouse.io"
+        api = f"https://{host}/v1/boards/{board}/jobs/{posting_id}"
+        if not await is_public_host(host):
+            return Page(original_url, None, None, "not a public address")
+        if not await self._allowed(api):
+            return Page(original_url, None, None, "blocked by robots.txt")
+        await self._polite(host)
+        try:
+            resp = await self._client.get(api, headers={"Accept": "application/json"})
+        except httpx.TimeoutException as e:
+            raise RetryableError(f"timeout fetching {host}") from e
+        except httpx.TransportError as e:
+            raise RetryableError(f"could not reach {host}: {e}") from e
+        if resp.status_code == 429 or resp.status_code >= 500:
+            retry_after = resp.headers.get("Retry-After", "")
+            raise RetryableError(
+                f"{host} answered {resp.status_code}",
+                retry_after=float(retry_after) if retry_after.isdigit() else None,
+                status=resp.status_code,
+            )
+        if resp.status_code == 404:
+            return Page(original_url, None, None, "no longer posted")
+        if resp.status_code != 200:
+            return Page(original_url, None, None, f"HTTP {resp.status_code}")
+        try:
+            item = resp.json()
+        except ValueError as e:
+            raise RetryableError(f"{host} sent invalid JSON") from e
+        if not isinstance(item, dict) or str(item.get("id") or "") != posting_id:
+            return Page(original_url, None, None, "not a job page")
+
+        content = item.get("content")
+        description = content[:MAX_DESCRIPTION] if isinstance(content, str) else ""
+        title = str(item.get("title") or "").strip()[:200] or None
+        structured: dict[str, Any] = {"@type": "JobPosting"}
+        if title:
+            structured["title"] = title
+        if description:
+            structured["description"] = description
+        location = item.get("location")
+        location_name = location.get("name") if isinstance(location, dict) else None
+        if isinstance(location_name, str) and location_name.strip():
+            structured["jobLocation"] = {
+                "address": {"addressLocality": location_name.strip()[:300]}
+            }
+        published = item.get("first_published") or item.get("updated_at")
+        if isinstance(published, str) and published.strip():
+            structured["datePosted"] = published.strip()
+
+        absolute_url = item.get("absolute_url")
+        if isinstance(absolute_url, str):
+            parts = urlsplit(absolute_url.strip())
+            final_url = (
+                absolute_url.strip()
+                if parts.scheme in ("http", "https") and "." in (parts.hostname or "")
+                else original_url
+            )
+        else:
+            final_url = original_url
+        text = description_text(structured)
+        return Page(
+            final_url,
+            title,
+            text,
+            None if text else "no readable text",
+            structured,
+        )
 
     async def _oracle(self, url: str, job: oracle.OracleJob) -> Page:
         """An Oracle job page is JavaScript-only; its public detail address has the job. The

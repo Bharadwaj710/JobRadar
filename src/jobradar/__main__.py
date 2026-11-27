@@ -505,10 +505,24 @@ def boards_add(
                 _fail(f"No {_ATS_NAMES[ref.ats]} board called '{ref.company}' (it answered 404).")
             except BoardUnavailable as e:
                 _fail(f"Couldn't read the board right now ({e}); try again in a minute.")
-        passing = [p for p in postings if why_skipped(p.title, p.location, p.level) is None]
+        try:
+            cfg = load_config(CONFIG_PATH)
+            cand_ind = getattr(cfg.sources.boards, "candidate_independent", False)
+        except Exception:
+            cand_ind = False
+        passing = [
+            p
+            for p in postings
+            if why_skipped(p.title, p.location, p.level, candidate_independent=cand_ind) is None
+        ]
+        status_suffix = (
+            "pass ingestion filters"
+            if cand_ind
+            else "pass your filters (India or remote, tech, not senior)"
+        )
         typer.echo(
             f"{_ATS_NAMES[ref.ats]} · {label}: {len(postings)} postings now, "
-            f"{len(passing)} pass your filters (India or remote, tech, not senior)."
+            f"{len(passing)} {status_suffix}."
         )
         for p in passing[:5]:
             typer.echo(f"  {p.title[:70]} · {p.location[:40]}")
@@ -791,6 +805,10 @@ def digest(
     now: Annotated[
         bool, typer.Option("--now", help="Send the digest for the current window right away.")
     ] = False,
+    candidate_id: Annotated[
+        str | None,
+        typer.Option("--candidate-id", help="Candidate ID (defaults to workspace owner)."),
+    ] = None,
 ) -> None:
     """Morning and evening summary email (sent automatically by `jobradar run`)."""
     from jobradar import app as application
@@ -804,7 +822,7 @@ def digest(
         _fail("Add to .env first: " + ", ".join(missing))
     repo, queue = application.open_store()
     try:
-        outcome = asyncio.run(Digest(settings, repo, queue).send_now())
+        outcome = asyncio.run(Digest(settings, repo, queue, candidate_id=candidate_id).send_now())
     except (PermanentError, RetryableError) as e:
         _fail(f"Not sent: {e}")
     typer.secho(f"✓ {outcome}", fg="green")
@@ -815,26 +833,44 @@ def followups(
     now: Annotated[
         bool, typer.Option("--now", help="Email the follow-ups that are due right away.")
     ] = False,
+    candidate_id: Annotated[
+        str | None,
+        typer.Option("--candidate-id", help="Candidate ID (defaults to workspace owner)."),
+    ] = None,
 ) -> None:
     """Jobs you set to Applied: days without a reply and when a follow-up draft is due."""
     from jobradar import app as application
     from jobradar.queue.tasks import PermanentError, RetryableError
+    from jobradar.sinks.candidate_context import resolve_sink_candidate
     from jobradar.sinks.followups import MAX_REMINDERS, QUIET_AFTER, FollowUpReminder
 
     settings = _settings()
     notify = settings.config.notify
     repo, queue = application.open_store()
-    reminder = FollowUpReminder(settings, repo, queue)
-    jobs = repo.jobs_applied()
+    cand, _ = resolve_sink_candidate(repo, settings, candidate_id=candidate_id)
+    cid = cand.id if cand else None
+    reminder = FollowUpReminder(settings, repo, queue, candidate_id=cid)
+    if cid:
+        pairs = repo.list_candidate_applications_with_jobs(cid, statuses=["applied"])
+        jobs = [j for _, j in pairs]
+    else:
+        jobs = repo.jobs_applied()
     if not jobs:
-        typer.echo("No job has Status Applied in Notion yet (JobRadar reads it every 2 minutes "
-                   "while `jobradar run` is running).")  # fmt: skip
+        msg = (
+            f"No applied jobs found for {cand.name}."
+            if cand
+            else "No job has Status Applied in Notion yet (JobRadar reads it every 2 minutes "
+            "while `jobradar run` is running)."
+        )
+        typer.echo(msg)
         return
     clock = datetime.now(UTC)
-    typer.echo(f"Follow-up drafts come {notify.followup_after_days} days after Applied (or your "
-               f"Followed Up date) with no reply, at most {MAX_REMINDERS} per job.")  # fmt: skip
+    typer.echo(
+        f"Follow-up drafts come {notify.followup_after_days} days after Applied (or your "
+        f"Followed Up date) with no reply, at most {MAX_REMINDERS} per job."
+    )
     for job in jobs:
-        applied, since, sent = reminder.status(job)
+        applied, since, sent = reminder.status(job, candidate_id=cid)
         quiet = (clock - since).days
         next_at = since + reminder.after
         if sent >= MAX_REMINDERS:
@@ -846,8 +882,10 @@ def followups(
         else:
             when = f"next draft {next_at.astimezone(notify.tz):%d %b}"
         role = f"{job.role or 'Role not stated'} @ {job.company or '?'}"
-        typer.echo(f"  {job.id[:8]}  {role[:48]:<48}  applied "
-                   f"{applied.astimezone(notify.tz):%d %b}  {when}")  # fmt: skip
+        typer.echo(
+            f"  {job.id[:8]}  {role[:48]:<48}  applied "
+            f"{applied.astimezone(notify.tz):%d %b}  {when}"
+        )
     if not now:
         return
     if not notify.followups:
@@ -927,13 +965,22 @@ def skills(days: Annotated[int, typer.Option(help="Look back this many days.")] 
 
 
 @app.command()
-def sources() -> None:
+def sources(
+    candidate_id: Annotated[
+        str | None,
+        typer.Option("--candidate-id", help="Candidate ID (defaults to workspace owner)."),
+    ] = None,
+) -> None:
     """Each chat, board or page you applied from, and how many reached the next round."""
     from jobradar import app as application
     from jobradar.by_source import by_source, render
+    from jobradar.sinks.candidate_context import resolve_sink_candidate
 
+    settings = _settings()
     repo, _ = application.open_store()
-    typer.echo(render(by_source(repo)))
+    cand, _ = resolve_sink_candidate(repo, settings, candidate_id=candidate_id)
+    cid = cand.id if cand else None
+    typer.echo(render(by_source(repo, candidate_id=cid)))
 
 
 @app.command()
@@ -968,6 +1015,78 @@ def stats(days: Annotated[int, typer.Option(help="Window in days.")] = 7) -> Non
     settings = _settings()
     repo, _ = application.open_store()
     typer.echo(render(build_report(repo, days, alert_above=settings.config.scoring.alert_above)))
+
+
+@app.command("migrate-legacy")
+def migrate_legacy(
+    apply: Annotated[
+        bool,
+        typer.Option(
+            "--apply",
+            help="Execute the migration and persist changes. Defaults to dry-run report.",
+        ),
+    ] = False,
+    owner_id: Annotated[
+        str | None,
+        typer.Option(
+            "--owner-id",
+            help="Explicit owner candidate ID override.",
+        ),
+    ] = None,
+) -> None:
+    """Migrate legacy owner-specific scores and application statuses to candidate tables."""
+    from jobradar import app as application
+    from jobradar.db.repo import OwnerResolutionError
+    from jobradar.services.migration_service import LegacyMigrationService
+
+    logs.setup()
+    settings = _settings()
+    repo, _ = application.open_store()
+    service = LegacyMigrationService(repo, settings)
+
+    if not apply:
+        typer.secho("--- Legacy Migration Audit (DRY-RUN) ---", fg="cyan", bold=True)
+        try:
+            report = service.audit(explicit_owner_id=owner_id)
+        except OwnerResolutionError as e:
+            typer.secho(f"Owner resolution error: {e}", fg="red", bold=True)
+            raise typer.Exit(code=1) from e
+        typer.echo(f"Owner Candidate: {report.owner_candidate_name} ({report.owner_candidate_id})")
+        typer.echo(f"Total Jobs in DB: {report.total_jobs}")
+        typer.echo(
+            f"Legacy Scores: {report.scores_eligible} eligible, "
+            f"{report.scores_already_migrated} already migrated"
+        )
+        typer.echo(
+            f"Legacy Applications: {report.applications_eligible} eligible, "
+            f"{report.applications_already_migrated} already migrated"
+        )
+        if report.manual_review_records:
+            typer.secho(
+                f"Records requiring manual review: {len(report.manual_review_records)}",
+                fg="yellow",
+            )
+            for rec in report.manual_review_records:
+                typer.echo(f"  - Job {rec['job_id']}: {rec['reason']}")
+        typer.secho(
+            "\nDry-run complete. No changes written. Run with '--apply' to execute migration.",
+            fg="green",
+        )
+        return
+
+    typer.secho("--- Executing Legacy Migration ---", fg="yellow", bold=True)
+    try:
+        result = service.migrate(dry_run=False, explicit_owner_id=owner_id)
+    except OwnerResolutionError as e:
+        typer.secho(f"Owner resolution error: {e}", fg="red", bold=True)
+        raise typer.Exit(code=1) from e
+    if result.success:
+        typer.secho(result.message, fg="green", bold=True)
+        if result.backup_path:
+            typer.echo(f"Pre-migration backup stored at: {result.backup_path}")
+    else:
+        typer.secho(result.message, fg="red", bold=True)
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

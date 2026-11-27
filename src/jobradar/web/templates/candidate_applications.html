@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}My Applications · JobRadar{% endblock %}
+
+{% block main %}
+<div class="head" style="margin-bottom: 24px;">
+  <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px;">
+    <div>
+      <h1 style="font-size: 26px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 6px;">
+        Candidate Application Pipeline
+      </h1>
+      <p class="lede" style="margin: 0; color: var(--muted); font-size: 14.5px;">
+        Track personal job application stages, interview rounds, and notes for <strong>{{ candidate.name }}</strong>.
+      </p>
+    </div>
+    <div style="display: flex; gap: 10px; align-items: center;">
+      <a href="/candidate/dashboard" class="btn-secondary-saas" style="text-decoration: none;">
+        &larr; Match Radar
+      </a>
+    </div>
+  </div>
+</div>
+
+{# Status Overview Badges #}
+<div style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 24px;">
+  <span class="badge" style="padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 9999px;">Saved: <b>{{ app_counts.saved }}</b></span>
+  <span class="badge hot" style="padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 9999px;">Applied: <b>{{ app_counts.applied }}</b></span>
+  <span class="badge" style="padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 9999px; background: var(--good-soft); color: var(--good); border: 1px solid var(--good);">Interviewing: <b>{{ app_counts.interviewing }}</b></span>
+  <span class="badge" style="padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 9999px; background: var(--good-soft); color: var(--good); border: 1px solid var(--good);">Offered: <b>{{ app_counts.offered }}</b></span>
+  <span class="badge" style="padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 9999px; background: var(--bad-soft); color: var(--bad); border: 1px solid var(--bad);">Rejected: <b>{{ app_counts.rejected }}</b></span>
+  <span class="badge" style="padding: 6px 14px; font-size: 13px; font-weight: 600; border-radius: 9999px; background: var(--raise); color: var(--muted); border: 1px solid var(--line);">Skipped: <b>{{ app_counts.skipped }}</b></span>
+</div>
+
+{# 6-Column Kanban Board #}
+<div class="kanban-grid-saas">
+  {% for col_key, col_title in [('saved', 'Saved'), ('applied', 'Applied'), ('interviewing', 'Interviewing'), ('offered', 'Offered'), ('rejected', 'Rejected'), ('skipped', 'Skipped')] %}
+  {% set items = columns[col_key] %}
+  <div class="kanban-col-saas">
+    <div class="kanban-col-header-saas">
+      <span class="kanban-col-title-saas">{{ col_title }}</span>
+      <span class="badge" style="font-size: 11px; padding: 2px 8px;">{{ items | length }}</span>
+    </div>
+
+    <div style="display: grid; gap: 10px;">
+      {% for item in items %}
+      <div class="kanban-item-saas">
+        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;">
+          <a href="/candidate/jobs/{{ item.application.job_id }}" style="font-weight: 700; font-size: 14px; color: var(--ink); text-decoration: none; line-height: 1.3;">
+            {{ item.title }}
+          </a>
+        </div>
+        <p style="margin: 0; font-size: 12.5px; color: var(--muted);">
+          <strong>{{ item.company }}</strong> &bull; {{ item.location }}
+        </p>
+
+        {% if item.application.notes %}
+          <p style="margin: 4px 0 0; font-size: 12px; color: var(--ink); background: var(--card); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); line-height: 1.4;">
+            💬 {{ item.application.notes }}
+          </p>
+        {% endif %}
+
+        {% if item.application.applied_at and col_key != 'saved' %}
+          <span style="font-size: 11.5px; color: var(--muted); margin-top: 2px; font-family: var(--mono);">
+            Applied: {{ item.application.applied_at[:10] }}
+          </span>
+        {% endif %}
+
+        <div style="display: flex; justify-content: flex-end; margin-top: 8px; border-top: 1px solid var(--line); padding-top: 6px;">
+          <a href="/candidate/jobs/{{ item.application.job_id }}" style="font-size: 12px; color: var(--accent); text-decoration: none; font-weight: 600;">
+            Update Status &rarr;
+          </a>
+        </div>
+      </div>
+      {% else %}
+      <div style="padding: 24px 8px; text-align: center; color: var(--muted); font-size: 12.5px; border: 1px dashed var(--line); border-radius: 8px;">
+        No jobs {{ col_title | lower }}.
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% endblock %}

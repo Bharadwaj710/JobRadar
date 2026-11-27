@@ -39,10 +39,10 @@ from email.message import EmailMessage
 from email.policy import default as default_policy
 from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 from urllib.parse import quote
 
-from jobradar.clock import Clock, utcnow
+from jobradar.clock import Clock, to_iso, utcnow
 from jobradar.config import Settings
 from jobradar.db.models import Job, JobStatus
 from jobradar.db.repo import Repo, TaskRecord
@@ -50,6 +50,7 @@ from jobradar.pipeline import status_rules as rules
 from jobradar.pipeline.dedupe import sha1
 from jobradar.pipeline.task_types import REPLY_CHECK
 from jobradar.queue.tasks import PermanentError, RetryableError, TaskQueue
+from jobradar.sinks.notion_sync import FOLLOWED_UP
 
 log = logging.getLogger(__name__)
 
@@ -61,9 +62,16 @@ REPLIED = "company_replied:"  # setting key prefix, per job: the company wrote b
 CHECK_SECONDS = 120
 LOOK_BACK = timedelta(days=7)
 ID_CHARS = 12
+TOKEN_EXPIRY_DAYS = 7
+
 _SUBJECT = re.compile(
     r"JobRadar action:\s*(applied|skip|followed up|interview|rejected)\b.*?"
     r"\b([0-9a-f]{12})\.([0-9a-f]{8})\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_CANDIDATE_SUBJECT = re.compile(
+    r"JobRadar action:\s*(applied|skip|followed up|interview|rejected)\b.*?"
+    r"\b([0-9a-f]{12})\.([A-Za-z0-9_-]+)\.(\d+)\.([0-9a-f]{16})\b",
     re.IGNORECASE | re.DOTALL,
 )
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -73,6 +81,37 @@ _HR_WORDS = re.compile(r"hr|career|recruit|talent|hiring|jobs|people|placement",
 _FROM = rules.FROM
 NOTION_OPTION = {"applied": "Applied", "skip": "Skipped", "interview": "Interview",
                  "rejected": "Rejected"}  # fmt: skip
+
+
+@dataclass
+class ParsedAction:
+    action: Action
+    prefix: str
+    candidate_id: str | None = None
+    expiry: int | None = None
+    signature: str = ""
+    is_legacy: bool = False
+
+    def __iter__(self) -> Any:
+        yield self.action
+        yield self.prefix
+
+    def __getitem__(self, idx: int) -> Any:
+        return (self.action, self.prefix)[idx]
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, tuple) and len(other) == 2:
+            return (self.action, self.prefix) == other
+        if isinstance(other, ParsedAction):
+            return (
+                self.action == other.action
+                and self.prefix == other.prefix
+                and self.candidate_id == other.candidate_id
+                and self.expiry == other.expiry
+                and self.signature == other.signature
+                and self.is_legacy == other.is_legacy
+            )
+        return False
 
 
 def _title(job: Job) -> str:
@@ -87,13 +126,30 @@ def mailto(to: str, subject: str, body: str) -> str:
 class Actions:
     """Makes the signed buttons and checks the emails they produce."""
 
-    def __init__(self, key: str, address: str, also_from: str | None = None) -> None:
+    def __init__(
+        self,
+        key: str,
+        address: str,
+        also_from: str | None = None,
+        candidate_id: str | None = None,
+        repo: Repo | None = None,
+        clock: Clock = utcnow,
+    ) -> None:
         self.key = key.encode()
         self.address = address
         self.senders = {a.casefold() for a in (address, also_from) if a}
+        self.candidate_id = candidate_id
+        self.repo = repo
+        self.clock = clock
 
     @classmethod
-    def load(cls, settings: Settings, repo: Repo) -> Actions | None:
+    def load(
+        cls,
+        settings: Settings,
+        repo: Repo,
+        candidate_id: str | None = None,
+        clock: Clock = utcnow,
+    ) -> Actions | None:
         """None when the buttons are off or there's no mailbox to read them from."""
         address = settings.secrets.email_address
         if not settings.config.notify.email_actions or not address:
@@ -102,14 +158,35 @@ class Actions:
         if not key:
             key = secrets.token_hex(16)
             repo.set_setting(KEY_SETTING, key)
-        return cls(key, address, settings.secrets.notify_address)
+        if candidate_id is None:
+            with contextlib.suppress(Exception):
+                cand = repo.resolve_owner_candidate_from_settings(settings)
+                candidate_id = cand.id
+        return cls(
+            key,
+            address,
+            settings.secrets.notify_address,
+            candidate_id=candidate_id,
+            repo=repo,
+            clock=clock,
+        )
 
     def sign(self, action: str, job_id: str) -> str:
         msg = f"{action.casefold()}:{job_id[:ID_CHARS]}".encode()
         return hmac.new(self.key, msg, hashlib.sha256).hexdigest()[:8]
 
-    def subject(self, action: Action, job: Job) -> str:
-        token = f"{job.id[:ID_CHARS]}.{self.sign(action, job.id)}"
+    def sign_candidate(self, action: str, job_id: str, candidate_id: str, expiry_ts: int) -> str:
+        msg = f"{action.casefold()}:{job_id[:ID_CHARS]}:{candidate_id}:{expiry_ts}".encode()
+        return hmac.new(self.key, msg, hashlib.sha256).hexdigest()[:16]
+
+    def subject(self, action: Action, job: Job, candidate_id: str | None = None) -> str:
+        cid = candidate_id or self.candidate_id
+        if cid:
+            expiry_ts = int(self.clock().timestamp() + TOKEN_EXPIRY_DAYS * 86400)
+            sig = self.sign_candidate(action, job.id, cid, expiry_ts)
+            token = f"{job.id[:ID_CHARS]}.{cid}.{expiry_ts}.{sig}"
+        else:
+            token = f"{job.id[:ID_CHARS]}.{self.sign(action, job.id)}"
         return f"{PREFIX} {action} | {_title(job)} | {token}"
 
     def link(self, action: Action, job: Job) -> str:
@@ -124,6 +201,14 @@ class Actions:
 
     def job_links(self, job: Job) -> list[tuple[str, str]]:
         """Buttons for a job you haven't applied to yet."""
+        if self.candidate_id and self.repo:
+            app = self.repo.get_candidate_application(self.candidate_id, job.id)
+            if app and app.status in ("applied", "interviewing", "offered", "rejected", "skipped"):
+                return []
+            return [
+                ("I applied", self.link("applied", job)),
+                ("Not interested", self.link("skip", job)),
+            ]
         if job.status not in _FROM["applied"]:
             return []
         return [
@@ -131,15 +216,51 @@ class Actions:
             ("Not interested", self.link("skip", job)),
         ]
 
-    def parse(self, subject: str) -> tuple[Action, str] | None:
-        """(action, job id prefix) for a genuine button email; None for anything else."""
+    def parse(self, subject: str) -> ParsedAction | None:
+        """ParsedAction for a genuine button email; None for anything else."""
+        m_cand = _CANDIDATE_SUBJECT.search(subject or "")
+        if m_cand:
+            action, prefix, cid, exp_str, sig = (
+                m_cand.group(1).casefold(),
+                m_cand.group(2),
+                m_cand.group(3),
+                int(m_cand.group(4)),
+                m_cand.group(5),
+            )
+            now_ts = int(self.clock().timestamp())
+            if now_ts > exp_str:
+                log.info("action token expired", extra={"job_prefix": prefix, "candidate_id": cid})
+                return None
+            expected_sig = self.sign_candidate(action, prefix, cid, exp_str)
+            if not hmac.compare_digest(expected_sig, sig):
+                log.warning(
+                    "action token signature mismatch",
+                    extra={"job_prefix": prefix, "candidate_id": cid},
+                )
+                return None
+            return ParsedAction(
+                action=action,  # type: ignore[arg-type]
+                prefix=prefix,
+                candidate_id=cid,
+                expiry=exp_str,
+                signature=sig,
+                is_legacy=False,
+            )
+
         m = _SUBJECT.search(subject or "")
         if not m:
             return None
         action, prefix, sig = m.group(1).casefold(), m.group(2), m.group(3)
         if not hmac.compare_digest(self.sign(action, prefix), sig):
             return None
-        return action, prefix  # type: ignore[return-value]
+        return ParsedAction(
+            action=action,  # type: ignore[arg-type]
+            prefix=prefix,
+            candidate_id=None,
+            expiry=None,
+            signature=sig,
+            is_legacy=True,
+        )
 
     def trusted(self, sender: str, auth_results: str) -> bool:
         addresses = {a.casefold() for _, a in getaddresses([sender]) if a}
@@ -403,18 +524,68 @@ class ReplyReader:
         if not self.actions.trusted(mail.sender, mail.auth_results):
             log.warning("button email not from you; ignored", extra={"from": mail.sender[:80]})
             return None
-        action, prefix = parsed
+
+        # Replay prevention check
+        sig_key = f"email_action_used:{parsed.signature}"
+        if self.repo.get_setting(sig_key):
+            log.warning(
+                "email action token already used (replay attack prevented)",
+                extra={"sig": parsed.signature},
+            )
+            return f"{parsed.action}: already used"
+
+        action, prefix = parsed.action, parsed.prefix
         matches = self.repo.jobs_with_prefix(prefix)
         job = self.repo.get_job(matches[0]) if len(matches) == 1 else None
         if job is None:
             return f"{action}: job {prefix} not found"
         title = _title(job)
         day = (mail.sent or self.clock()).astimezone(self.tz).date()
+
+        # Candidate-bound action
+        if parsed.candidate_id:
+            cand = self.repo.get_candidate(parsed.candidate_id)
+            if cand is None:
+                log.warning(
+                    "candidate not found for action token",
+                    extra={"candidate_id": parsed.candidate_id},
+                )
+                return f"{action}: candidate {parsed.candidate_id} not found"
+
+            if action == "followed up":
+                day_iso = day.isoformat()
+                self.repo.set_setting(f"followed_up:{cand.id}:{job.id}", day_iso)
+                self.repo.set_setting(FOLLOWED_UP + job.id, day_iso)
+            else:
+                applied_at = day.isoformat() if action == "applied" else None
+                try:
+                    self.repo.apply_candidate_action(
+                        candidate_id=cand.id,
+                        job_id=job.id,
+                        action=action,
+                        applied_at=applied_at,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "failed to apply candidate action",
+                        extra={"error": str(e), "action": action},
+                    )
+                    return f"{action}: error applying action"
+
+            self.repo.set_setting(sig_key, to_iso(self.clock()))
+            log.info(
+                "applied candidate action from email",
+                extra={"candidate_id": cand.id, "job_id": job.id, "action": action},
+            )
+            return f"{action}: {title}"
+
+        # Legacy fallback
         outcome = rules.act(self.repo, self.queue, job, action, day, build_resumes=False)
         if not outcome.ok:
             about = {"job_id": job.id[:10], "action": action, "status": job.status}
             log.info("button email ignored: status has moved on", extra=about)
             self.ignored.append((job, action))
             return f"{action} ignored for {title}: it's {job.status} now"
+        self.repo.set_setting(sig_key, to_iso(self.clock()))
         log.info("your email action", extra={"job_id": job.id[:10], "action": action})
         return f"{action}: {title}"

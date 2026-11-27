@@ -2,6 +2,15 @@
 {% from "_macros.html" import ring, avatar, status, reasons, bar, act_form with context %}
 {% block title %}{{ job.card.role }}{% if job.card.company %} @ {{ job.card.company }}{% endif %} · JobRadar{% endblock %}
 {% block main %}
+<div class="candidate-switch-banner card-saas" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; margin-bottom: 20px; background: var(--accent-soft); border-color: var(--accent); flex-wrap: wrap; gap: 12px;">
+  <div style="font-size: 13.5px; color: var(--ink);">
+    <strong>Candidate Perspective Available:</strong> View your personalized 4-track fit, eligibility gates, and application status.
+  </div>
+  <a href="/candidate/jobs/{{ job.card.id }}" class="btn-primary-saas" style="text-decoration: none; padding: 6px 14px; font-size: 13px;">
+    View Candidate Fit &rarr;
+  </a>
+</div>
+
 <article class="job">
   <header class="job-head">
     {{ avatar(job.card, 'lg') }}
@@ -10,7 +19,7 @@
       <p class="company">{{ job.card.company or 'Company not stated' }}</p>
       <p class="meta">{{ status(job.card) }}{% set n = job.card.closes_in %}{% if n is not none %}<span class="due {{ 'over' if n < 0 else ('soon' if n <= 3 else '') }}"><svg class="i xs"><use href="#i-clock"/></svg>{% if n < 0 %}closed {{ job.card.closes }}{% elif n == 0 %}closes today{% elif n == 1 %}closes tomorrow{% else %}closes in {{ n }} days{% endif %}</span>{% endif %}<span class="faint">first seen {{ job.card.seen }}</span>{% if job.card.moved %}<span class="faint">status set {{ job.card.moved }}</span>{% endif %}</p>
     </div>
-    {{ ring(job.card.score, 'lg') }}
+    {% if job.card.score is not none %}{{ ring(job.card.score, 'lg') }}{% elif job.card.historical_score is not none %}<div class="legacy-ring-wrap" title="Historical Legacy Score"><span class="legacy-score-lg">{{ job.card.historical_score }}</span><span class="legacy-badge">legacy_matcher</span></div>{% else %}{{ ring(none, 'lg') }}{% endif %}
   </header>
 
   <section class="panel decide" aria-label="Your status">
@@ -23,7 +32,7 @@
       <label for="set-status">Change status</label>
       <input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="next" value="{{ request.url.path }}">
       <select id="set-status" name="status">
-        {% for st, text in statuses %}<option value="{{ st.value }}" {% if st.value == job.card.status or (st.value == 'shortlisted' and job.card.status == 'resume_ready') %}selected{% endif %}>{{ text }}</option>{% endfor %}
+        {% for st, text in statuses %}<option value="{{ st.value }}" {% if st.value == job.card.status or (st.value == 'shortlisted' and job.card.status in ('saved', 'resume_ready')) or (st.value == 'interview' and job.card.status == 'interviewing') or (st.value == 'offer' and job.card.status == 'offered') %}selected{% endif %}>{{ text }}</option>{% endfor %}
       </select>
       <button type="submit" class="btn quiet">Save</button>
     </form>
@@ -49,6 +58,102 @@
       <li class="gate"><span class="part-name">Open to you</span><span class="part-w faint">a gate, not part of the score</span>{{ bar(job.breakdown.eligible, 'good' if job.breakdown.eligible >= 70 else ('fair' if job.breakdown.eligible > 30 else 'poor')) }}<span class="part-v">{{ job.breakdown.eligible }}</span></li>
       {% endif %}
     </ul>
+  </section>
+  {% endif %}
+
+  {% if job.historical_assessment %}
+  <section class="panel historical-assessment">
+    <div class="panel-head">
+      <h2>Legacy match score</h2>
+      <p class="faint">Evaluated with <code>legacy_matcher</code></p>
+    </div>
+    <div class="legacy-score-box">
+      <span class="badge legacy-badge">legacy_matcher</span>
+      <b class="legacy-score-num">{{ job.historical_assessment.score }}</b> <span class="faint">/ 100</span>
+      {% if job.historical_assessment.score_reason %}<p class="legacy-reason faint">{{ job.historical_assessment.score_reason }}</p>{% endif %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% if job.track_assessments %}{% set matches = job.track_assessments %}
+  <section class="panel track-assessments">
+    <div class="panel-head">
+      <h2>Four-track technical fit</h2>
+      <p class="faint">{% if matches.active_version %}Profile <code>{{ matches.active_version }}</code>{% else %}No active four-track profile{% endif %}</p>
+    </div>
+    {% if matches.message %}<p class="track-state {{ matches.state }}">{{ matches.message }}{% if matches.stored_versions %} Stored version{{ '' if matches.stored_versions|length == 1 else 's' }}: <code>{{ matches.stored_versions|join(', ') }}</code>.{% endif %}</p>{% endif %}
+    {% if matches.eligibility %}{% set eligibility = matches.eligibility %}
+    <div class="eligibility-detail e-{{ eligibility.status|lower }}">
+      <div><span>Eligibility</span><b>{{ eligibility.label }}</b></div>
+      {% if eligibility.blockers %}<p><b>Blocking conditions:</b> {{ eligibility.blockers|join('; ') }}</p>{% endif %}
+      {% if eligibility.unresolved %}<p><b>Needs verification:</b> {{ eligibility.unresolved|join('; ') }}</p>{% endif %}
+      {% if eligibility.checks %}
+      <details>
+        <summary>Eligibility evidence</summary>
+        <ul class="eligibility-checks">
+          {% for check in eligibility.checks %}
+          <li class="check-{{ check.status }}"><b>{{ check.dimension }}</b><span>{{ check.reason }}</span>{% if check.evidence %}<small>{{ check.evidence|join(' · ') }}</small>{% endif %}</li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% if matches.tracks %}
+    <div class="track-grid">
+      {% for track in matches.tracks %}
+      <article class="track-panel {{ 'unavailable' if not track.available else track.status }}">
+        <header>
+          <h3>{{ track.label }}</h3>
+          {% if track.available %}<b class="track-score">{{ track.score if track.score is not none else 'Unscored' }}</b>{% else %}<b class="track-score">Unavailable</b>{% endif %}
+        </header>
+        {% if track.available %}
+          <p class="track-coverage">{{ track.evidence }}% evidence coverage</p>
+          {% if track.unscored_reason %}<p class="track-why"><b>Why there is no score:</b> {{ track.unscored_reason }}</p>{% endif %}
+          {% if track.matched_required %}<div class="skills"><b>Matched required skills</b><ul class="chips">{% for skill in track.matched_required %}<li class="have">{{ skill }}</li>{% endfor %}</ul></div>{% endif %}
+          {% if track.missing_required %}<div class="skills"><b>Missing required skills</b><ul class="chips">{% for skill in track.missing_required %}<li class="missing">{{ skill }}</li>{% endfor %}</ul></div>{% endif %}
+          {% if track.preferred_skills %}<div class="skills"><b>Preferred skills</b><ul class="chips">{% for skill in track.preferred_skills %}<li class="{{ 'have' if skill in track.matched_preferred else 'maybe' }}">{{ skill }}</li>{% endfor %}</ul></div>{% endif %}
+          {% if track.projects %}<p><b>Relevant projects:</b> {{ track.projects|join(', ') }}</p>{% endif %}
+          {% if track.internships %}<p><b>Relevant internships:</b> {{ track.internships|join(', ') }}</p>{% endif %}
+          {% if track.experience %}<p><b>Relevant experience:</b> {{ track.experience|join(', ') }}</p>{% endif %}
+          <p class="track-explanation">{{ track.explanation }}</p>
+          {% if track.resume %}<p class="resume-recommendation"><b>Recommended resume:</b> {{ track.resume }}</p>{% endif %}
+        {% else %}<p>{{ track.explanation }}</p>{% endif %}
+      </article>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if job.lead %}{% set lead = job.lead %}
+  <section class="panel lead-panel p-{{ lead.priority }}">
+    <div class="panel-head">
+      <h2>Application lead</h2>
+      <p class="faint">Verified {{ lead.verified }} · Profile <code>{{ lead.profile_version }}</code></p>
+    </div>
+    {% if lead.state == 'stale' %}<p class="track-state stale">This enrichment uses an older profile version. It has not been silently treated as current.</p>{% endif %}
+    <div class="lead-summary">
+      <div><span>Priority</span><b>{{ lead.priority_label }}</b></div>
+      <div><span>Reviewed track</span><b>{{ lead.primary_track_label }}</b></div>
+      <div><span>Vacancy</span><b>{{ lead.vacancy }}</b></div>
+      <div><span>Eligibility</span><b>{{ lead.eligibility }}</b></div>
+      <div><span>Technical fit</span><b>{{ lead.technical_score if lead.technical_score is not none else 'Unscored' }}</b></div>
+      {% if lead.location %}<div><span>Location</span><b>{{ lead.location }}</b></div>{% endif %}
+      <div><span>Work mode</span><b>{{ lead.work_mode|capitalize }}</b></div>
+      {% if lead.internship_duration %}<div><span>Duration</span><b>{{ lead.internship_duration }}</b></div>{% endif %}
+      {% if lead.compensation %}<div><span>Compensation</span><b>{{ lead.compensation }}</b></div>{% endif %}
+      {% if lead.recommended_resume %}<div><span>Resume</span><b>{{ lead.recommended_resume }}</b></div>{% endif %}
+    </div>
+    {% if lead.eligibility_evidence %}<div><h3>Verified eligibility evidence</h3><ul>{% for item in lead.eligibility_evidence %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+    {% if lead.unresolved %}<div><h3>Needs manual verification</h3><ul>{% for item in lead.unresolved %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+    {% if lead.mandatory_experience or lead.preferred_experience %}<div><h3>Experience requirements</h3>{% if lead.mandatory_experience %}<p><b>Mandatory:</b> {{ lead.mandatory_experience|join('; ') }}</p>{% endif %}{% if lead.preferred_experience %}<p><b>Preferred:</b> {{ lead.preferred_experience|join('; ') }}</p>{% endif %}</div>{% endif %}
+    {% if lead.priority_reasons %}<div><h3>Why this priority</h3><ul>{% for item in lead.priority_reasons %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+    {% if lead.application_strategy %}<div><h3>Application strategy</h3><p>{{ lead.application_strategy }}</p></div>{% endif %}
+    {% if lead.contacts %}<div><h3>Verified public contacts</h3><ul class="lead-contacts">{% for contact in lead.contacts %}<li><b>{{ contact.name or contact.position }}</b>{% if contact.name %}<span>{{ contact.position }}</span>{% endif %}<span>{{ contact.company }} · {{ contact.confidence }} confidence · verified {{ contact.verified_on }}</span>{% if contact.public_work_email %}<a href="mailto:{{ contact.public_work_email|urlencode }}">{{ contact.public_work_email }}</a>{% endif %}{% if contact.professional_profile %}<a href="{{ contact.professional_profile }}" target="_blank" rel="noopener noreferrer">Public profile</a>{% endif %}{% if contact.official_route %}<a href="{{ contact.official_route }}" target="_blank" rel="noopener noreferrer">Official contact route</a>{% endif %}<a href="{{ contact.source_url }}" target="_blank" rel="noopener noreferrer">Evidence</a></li>{% endfor %}</ul></div>{% endif %}
+    {% if lead.outreach_draft %}<details><summary>Truthful outreach draft</summary><pre class="draft-body">{{ lead.outreach_draft }}</pre></details>{% endif %}
+    {% if lead.cover_letter_draft %}<details><summary>Truthful cover-letter draft</summary><pre class="draft-body">{{ lead.cover_letter_draft }}</pre></details>{% endif %}
+    <p class="links"><a class="btn" href="{{ lead.official_application_url }}" target="_blank" rel="noopener noreferrer">Official application <svg class="i xs"><use href="#i-out"/></svg></a>{% if lead.official_source_url != lead.official_application_url %}<a class="btn quiet" href="{{ lead.official_source_url }}" target="_blank" rel="noopener noreferrer">Verification source <svg class="i xs"><use href="#i-out"/></svg></a>{% endif %}</p>
   </section>
   {% endif %}
 

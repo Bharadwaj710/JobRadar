@@ -44,6 +44,7 @@ from jobradar.config import Settings
 from jobradar.db.models import Job, JobStatus
 from jobradar.db.repo import Repo
 from jobradar.pipeline.dedupe import norm
+from jobradar.sinks.candidate_context import resolve_sink_candidate
 from jobradar.sinks.email_actions import PREFIX, REPLIED, Action, Actions
 from jobradar.sinks.email_notify import PREVIEW_DIR, notion_url, save_preview, smtp_send
 from jobradar.sinks.email_template import INK, MUTED, action_button, esc, job_card, layout
@@ -186,6 +187,7 @@ class CompanyReplies:
         settings: Settings,
         repo: Repo,
         actions: Actions,
+        candidate_id: str | None = None,
         clock: Clock = utcnow,
         preview_dir: Path = PREVIEW_DIR,
     ) -> None:
@@ -193,6 +195,7 @@ class CompanyReplies:
         self.notify = settings.config.notify
         self.repo = repo
         self.actions = actions
+        self.candidate_id = candidate_id
         self.clock = clock
         self.preview_dir = preview_dir
         self.own = {a.casefold() for a in (settings.secrets.email_address,
@@ -218,7 +221,15 @@ class CompanyReplies:
 
     def scan(self, imap: imaplib.IMAP4_SSL) -> list[str]:
         """Look at mail that arrived since the last scan; returns one line per suggestion."""
-        jobs = self.repo.jobs_you_moved_to([JobStatus.APPLIED, JobStatus.INTERVIEW])
+        cand, _ = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        if cand:
+            pairs = self.repo.list_candidate_applications_with_jobs(
+                cand.id, statuses=["applied", "interviewing"]
+            )
+            jobs = [job for _, job in pairs]
+        else:
+            jobs = self.repo.jobs_you_moved_to([JobStatus.APPLIED, JobStatus.INTERVIEW])
+
         validity, uids = self._new_uids(imap)
         replies: list[Reply] = []
         for uid in uids if jobs else []:
@@ -229,9 +240,18 @@ class CompanyReplies:
         if not replies:
             return []
         for r in replies:
-            self.repo.set_setting(REPLIED + r.job.id, json.dumps(
-                {"kind": r.kind, "subject": r.subject[:200], "from": r.sender[:200],
-                 "day": r.day, "message_id": r.message_id}))  # fmt: skip
+            payload = json.dumps(
+                {
+                    "kind": r.kind,
+                    "subject": r.subject[:200],
+                    "from": r.sender[:200],
+                    "day": r.day,
+                    "message_id": r.message_id,
+                }
+            )
+            if cand:
+                self.repo.set_setting(f"company_replied:{cand.id}:{r.job.id}", payload)
+            self.repo.set_setting(REPLIED + r.job.id, payload)
             log.info("company replied", extra={"job_id": r.job.id[:10], "kind": r.kind})
         self._send(replies)
         return [f"{r.job.company} replied: {r.kind}" for r in replies]
@@ -260,7 +280,16 @@ class CompanyReplies:
         _, full = imap.uid("FETCH", uid, "(BODY.PEEK[])")
         body = next((p[1] for p in full if isinstance(p, tuple)), b"")
         kind = classify(subject, body_text(email.message_from_bytes(body, policy=default_policy)))
-        if kind is None or (job.status == JobStatus.INTERVIEW.value and kind != "rejected"):
+
+        cand, _ = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        is_interview = False
+        if cand:
+            app = self.repo.get_candidate_application(cand.id, job.id)
+            is_interview = app is not None and app.status == "interviewing"
+        else:
+            is_interview = job.status == JobStatus.INTERVIEW.value
+
+        if kind is None or (is_interview and kind != "rejected"):
             return None  # nothing new: a confirmation, or another round you already know of
         try:
             sent = parsedate_to_datetime(str(head["Date"])).astimezone(self.notify.tz)
@@ -270,15 +299,26 @@ class CompanyReplies:
         return Reply(job, kind, subject, sender, day, message_id)
 
     def _seen(self, job: Job, message_id: str) -> bool:
-        raw = self.repo.get_setting(REPLIED + job.id)
+        cand, _ = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        raw = None
+        if cand:
+            raw = self.repo.get_setting(f"company_replied:{cand.id}:{job.id}")
+        if raw is None:
+            raw = self.repo.get_setting(REPLIED + job.id)
         return raw is not None and json.loads(raw).get("message_id") == message_id
 
     # ---- telling you --------------------------------------------------------------------
 
     def _send(self, replies: list[Reply]) -> None:
+        cand, _ = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        actions = self.actions
+        if cand and not self.actions.candidate_id:
+            loaded = Actions.load(self.settings, self.repo, candidate_id=cand.id, clock=self.clock)
+            if loaded:
+                actions = loaded
         secrets = self.settings.secrets
         sender = secrets.email_address or "jobradar@localhost"
-        msg = build_suggestions(replies, sender, secrets.notify_address or sender, self.actions,
+        msg = build_suggestions(replies, sender, secrets.notify_address or sender, actions,
                                 self.gmail, self.settings.config.notion.enabled)  # fmt: skip
         if self.notify.dry_run:
             path = save_preview(

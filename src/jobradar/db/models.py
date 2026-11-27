@@ -3,7 +3,11 @@
 Mirrors the LLD schema. Timestamps are UTC text from `jobradar.clock.to_iso`.
 """
 
+from __future__ import annotations
+
+import json
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import CheckConstraint, Index, UniqueConstraint
 from sqlmodel import Field, SQLModel
@@ -173,6 +177,93 @@ class MatchResult(SQLModel, table=True):
     created_at: str
 
 
+class JobTrackMatch(SQLModel, table=True):
+    """One evidence-backed career-track assessment for a job and profile version.
+
+    The legacy `match_result` and `job.score` remain the global matching path.  This additive
+    table keeps all four J4 assessments without duplicating the job or overwriting that score.
+    """
+
+    __tablename__ = "job_track_match"
+    __table_args__ = (
+        CheckConstraint(
+            "track IN ('ai_backend', 'full_stack', 'sde', 'sdet')",
+            name="job_track_match_track_value",
+        ),
+        CheckConstraint(
+            "technical_score IS NULL OR technical_score BETWEEN 0 AND 100",
+            name="job_track_match_score_range",
+        ),
+        CheckConstraint(
+            "evidence_coverage BETWEEN 0 AND 1",
+            name="job_track_match_coverage_range",
+        ),
+        CheckConstraint(
+            "eligibility_status IN "
+            "('ELIGIBLE', 'LIKELY_ELIGIBLE', 'NEEDS_VERIFICATION', 'NOT_ELIGIBLE')",
+            name="job_track_match_eligibility_value",
+        ),
+        Index("job_track_match_track_score", "track", "technical_score"),
+        Index("job_track_match_profile_version", "profile_version"),
+    )
+
+    job_id: str = Field(foreign_key="job.id", primary_key=True)
+    profile_version: str = Field(primary_key=True)
+    track: str = Field(primary_key=True)
+    technical_score: int | None = None
+    evidence_coverage: float = Field(ge=0, le=1)
+    eligibility_status: str
+    recommended_resume: str | None = None
+    explanation: str
+    assessment_json: str
+    eligibility_json: str
+    created_at: str
+    updated_at: str
+
+
+class JobLead(SQLModel, table=True):
+    """Current verified application-readiness record for one job.
+
+    Stable job and technical-match facts remain in their existing tables. This row stores the
+    time-sensitive vacancy check, reviewed primary track, public contact evidence, and priority.
+    """
+
+    __tablename__ = "job_lead"
+    __table_args__ = (
+        CheckConstraint(
+            "primary_track IN ('ai_backend', 'full_stack', 'sde', 'sdet')",
+            name="job_lead_primary_track_value",
+        ),
+        CheckConstraint(
+            "vacancy_status IN ('active', 'expired', 'unknown')",
+            name="job_lead_vacancy_status_value",
+        ),
+        CheckConstraint(
+            "eligibility_status IN "
+            "('ELIGIBLE', 'LIKELY_ELIGIBLE', 'NEEDS_VERIFICATION', 'NOT_ELIGIBLE')",
+            name="job_lead_eligibility_value",
+        ),
+        CheckConstraint(
+            "application_priority IN ('apply_now', 'review', 'low', 'exclude')",
+            name="job_lead_priority_value",
+        ),
+        Index("job_lead_priority", "application_priority", "last_verified_at"),
+        Index("job_lead_profile_version", "profile_version"),
+    )
+
+    job_id: str = Field(foreign_key="job.id", primary_key=True)
+    profile_version: str
+    primary_track: str
+    vacancy_status: str
+    eligibility_status: str
+    application_priority: str
+    official_application_url: str
+    last_verified_at: str
+    enrichment_json: str
+    created_at: str
+    updated_at: str
+
+
 class StatusChange(SQLModel, table=True):
     """Every Status you set in Notion, with when JobRadar noticed: your application funnel."""
 
@@ -254,3 +345,247 @@ class LLMCache(SQLModel, table=True):
     output: str
     cost_inr: float | None = None
     created_at: str
+
+
+class Candidate(SQLModel, table=True):
+    """A candidate using JobRadar to discover and track opportunities."""
+
+    __tablename__ = "candidate"
+
+    id: str = Field(primary_key=True)  # uuid4
+    display_name: str | None = None
+    email: str | None = Field(default=None, unique=True, index=True)
+    created_at: str
+    updated_at: str
+
+    @property
+    def name(self) -> str | None:
+        return self.display_name
+
+
+class Resume(SQLModel, table=True):
+    """An uploaded candidate resume document (PDF or DOCX).
+
+    Privacy and Security Note:
+    Raw uploaded resume binaries are processed in-memory during onboarding extraction and
+    are intentionally NOT persisted to the local filesystem or public directories. This
+    ensures sensitive personal candidate data is not stored insecurely. The `stored_path`
+    attribute records the logical storage URI / identifier for tracking provenance.
+    """
+
+    __tablename__ = "resume"
+
+    id: str = Field(primary_key=True)  # uuid4
+    candidate_id: str = Field(foreign_key="candidate.id", index=True)
+    original_filename: str
+    stored_path: str = Field(
+        description="Logical storage URI or identifier for tracking document provenance. "
+        "Raw binaries are processed in-memory and not stored on disk for privacy."
+    )
+    file_type: str  # "pdf" | "docx"
+    file_size: int
+    extraction_status: str  # "extracted" | "empty_or_scanned" | "unreadable" | "failed"
+    extracted_text: str | None = None
+    created_at: str
+
+    @property
+    def filename(self) -> str:
+        return self.original_filename
+
+    @property
+    def raw_text(self) -> str:
+        return self.extracted_text or ""
+
+
+class CandidateProfile(SQLModel, table=True):
+    """A versioned structured profile draft or confirmed profile for a candidate."""
+
+    __tablename__ = "candidate_profile"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", "version", name="candidate_profile_version"),
+    )
+
+    id: str = Field(primary_key=True)  # uuid4
+    candidate_id: str = Field(foreign_key="candidate.id", index=True)
+    resume_id: str | None = Field(default=None, foreign_key="resume.id")
+    version: int = 1
+    profile_data_json: str  # structured JSON adhering to ResumeProfileDraft
+    review_status: str = "draft"  # "draft" | "confirmed"
+    is_active: bool = False
+    confirmed_at: str | None = None
+    created_at: str
+    updated_at: str
+
+    @property
+    def profile_data(self) -> dict[str, Any]:
+
+        return json.loads(self.profile_data_json) if self.profile_data_json else {}
+
+    @property
+    def status(self) -> str:
+        return self.review_status
+
+
+class CandidateJobAssessment(SQLModel, table=True):
+    """Candidate-specific four-track technical match and eligibility assessment.
+
+    Evaluates a shared normalized Job record against a specific CandidateProfile version.
+    Isolated by candidate_id to prevent any cross-candidate overwrites.
+    """
+
+    __tablename__ = "candidate_job_assessment"
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "job_id",
+            "profile_version",
+            "track",
+            name="candidate_job_assessment_candidate_job_version_track",
+        ),
+        CheckConstraint(
+            "track IN ('ai_backend', 'full_stack', 'sde', 'sdet')",
+            name="candidate_job_assessment_track_value",
+        ),
+        CheckConstraint(
+            "technical_score IS NULL OR technical_score BETWEEN 0 AND 100",
+            name="candidate_job_assessment_score_range",
+        ),
+        CheckConstraint(
+            "evidence_coverage BETWEEN 0 AND 1",
+            name="candidate_job_assessment_coverage_range",
+        ),
+        CheckConstraint(
+            "eligibility_status IN "
+            "('ELIGIBLE', 'LIKELY_ELIGIBLE', 'NEEDS_VERIFICATION', 'NOT_ELIGIBLE')",
+            name="candidate_job_assessment_eligibility_value",
+        ),
+        Index("candidate_job_assessment_lookup", "candidate_id", "job_id"),
+        Index(
+            "candidate_job_assessment_ranking",
+            "candidate_id",
+            "track",
+            "technical_score",
+        ),
+    )
+
+    id: str = Field(primary_key=True)  # uuid4
+    candidate_id: str = Field(foreign_key="candidate.id", index=True)
+    job_id: str = Field(foreign_key="job.id", index=True)
+    profile_id: str = Field(foreign_key="candidate_profile.id")
+    profile_version: int
+    track: str
+    technical_score: int | None = None
+    evidence_coverage: float = Field(ge=0, le=1)
+    eligibility_status: str
+    eligibility_reasons_json: str = "[]"  # list[str] of blockers / unresolved reasons
+    matched_skills_json: str = "[]"  # list[str]
+    missing_required_skills_json: str = "[]"  # list[str]
+    missing_preferred_skills_json: str = "[]"  # list[str]
+    recommended_resume: str | None = None
+    explanation: str
+    assessment_json: str  # full serialized TrackAssessment
+    eligibility_json: str  # full serialized EligibilityResult
+    created_at: str
+    updated_at: str
+
+    @property
+    def matched_skills(self) -> list[str]:
+        return json.loads(self.matched_skills_json) if self.matched_skills_json else []
+
+    @property
+    def missing_required_skills(self) -> list[str]:
+        return (
+            json.loads(self.missing_required_skills_json)
+            if self.missing_required_skills_json
+            else []
+        )
+
+    @property
+    def missing_preferred_skills(self) -> list[str]:
+        return (
+            json.loads(self.missing_preferred_skills_json)
+            if self.missing_preferred_skills_json
+            else []
+        )
+
+    @property
+    def eligibility_reasons(self) -> list[str]:
+        return json.loads(self.eligibility_reasons_json) if self.eligibility_reasons_json else []
+
+
+class CandidateApplicationStatus(StrEnum):
+    SAVED = "saved"
+    APPLIED = "applied"
+    INTERVIEWING = "interviewing"
+    OFFERED = "offered"
+    REJECTED = "rejected"
+    SKIPPED = "skipped"
+
+
+class CandidateApplication(SQLModel, table=True):
+    """Independent candidate-level application tracking for a job."""
+
+    __tablename__ = "candidate_application"
+    __table_args__ = (
+        UniqueConstraint("candidate_id", "job_id", name="candidate_application_candidate_job"),
+        CheckConstraint(
+            "status IN ('saved', 'applied', 'interviewing', 'offered', 'rejected', 'skipped')",
+            name="candidate_application_status_value",
+        ),
+        Index("candidate_application_candidate_status", "candidate_id", "status"),
+    )
+
+    id: str = Field(primary_key=True)  # uuid4
+    candidate_id: str = Field(foreign_key="candidate.id", index=True)
+    job_id: str = Field(foreign_key="job.id", index=True)
+    status: str = "saved"
+    applied_at: str | None = None
+    notes: str = ""
+    created_at: str
+    updated_at: str
+
+
+class CandidateApplicationHistory(SQLModel, table=True):
+    """Audit log of candidate-specific application status transitions."""
+
+    __tablename__ = "candidate_application_history"
+    __table_args__ = (Index("candidate_app_history_candidate_job", "candidate_id", "job_id"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    candidate_id: str = Field(foreign_key="candidate.id", index=True)
+    job_id: str = Field(foreign_key="job.id", index=True)
+    status: str
+    notes: str = ""
+    changed_at: str
+
+
+class CandidateHistoricalAssessment(SQLModel, table=True):
+    """Preserved historical legacy Matcher score and reasoning for a candidate.
+
+    Stores original numeric scores (0-100) and reasoning from the legacy Matcher
+    without contaminating J4 technical scores or fabricating J4 track assessments.
+    """
+
+    __tablename__ = "candidate_historical_assessment"
+    __table_args__ = (
+        UniqueConstraint(
+            "candidate_id",
+            "job_id",
+            name="candidate_historical_assessment_candidate_job",
+        ),
+        Index("ix_candidate_historical_assessment_lookup", "candidate_id", "job_id"),
+        CheckConstraint(
+            "score BETWEEN 0 AND 100",
+            name="candidate_historical_assessment_score_range",
+        ),
+    )
+
+    id: str = Field(primary_key=True)  # uuid4
+    candidate_id: str = Field(foreign_key="candidate.id", index=True)
+    job_id: str = Field(foreign_key="job.id", index=True)
+    score: int
+    score_reason: str = Field(default="")
+    scoring_system: str = Field(default="legacy_matcher")
+    scored_at: str | None = Field(default=None)
+    created_at: str
+    updated_at: str

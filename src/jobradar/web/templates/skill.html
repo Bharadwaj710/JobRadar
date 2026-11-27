@@ -7,6 +7,16 @@
   <span class="windows">{% for d, text in [(7, '7 days'), (30, '30 days'), (90, '90 days')] %}<a href="/skills/{{ s.key|urlencode }}?days={{ d }}" {% if d == s.days %}aria-current="page"{% endif %}>{{ text }}</a>{% endfor %}</span>
 </nav>
 
+{% if active_profile %}
+<div class="card" style="background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 18px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between;">
+  <div>
+    <span style="font-size: 13px; color: var(--muted);">Candidate:</span>
+    <strong style="margin-left: 6px; font-size: 14.5px; color: var(--ink);">{{ active_profile.profile_data.basics.name or candidate.name }}</strong>
+  </div>
+  <span class="badge hot">Version {{ active_profile.version }}</span>
+</div>
+{% endif %}
+
 <header class="sk-hero">
   <div class="sk-said">
     <h1 class="sk-name">{{ s.name }}</h1>
@@ -27,8 +37,8 @@
   </ul>
   {% if s.start %}<p class="roll-start">{{ s.start }}</p>{% endif %}
   {% if s.missing %}
-  <form method="post" action="/skills/know" class="know">
-    <input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="next" value="/skills?days={{ s.days }}"><input type="hidden" name="skill" value="{{ s.name }}">
+  <form method="post" action="/skills/know" class="know" data-know>
+    <input type="hidden" name="token" value="{{ csrf_token or token }}"><input type="hidden" name="next" value="/skills?days={{ s.days }}"><input type="hidden" name="skill" value="{{ s.name }}">
     <button type="submit" class="chip-btn"><svg class="i xs"><use href="#i-check"/></svg>I know {{ s.name }}: add it to my profile</button>
   </form>
   {% endif %}

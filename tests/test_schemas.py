@@ -41,3 +41,46 @@ def test_is_job() -> None:
     assert not JobPosting(company="Scaler", confidence=0.05).is_job  # an ad: no role
     assert not JobPosting(confidence=0.2).is_job
     assert JobPosting(confidence=0.9).is_job
+
+
+def test_additive_role_and_requirement_schema() -> None:
+    posting = JobPosting.model_validate(
+        {
+            "role": "Backend Intern",
+            "role_tracks": [
+                {
+                    "track": "ai_backend",
+                    "strength": "strong",
+                    "evidence": [
+                        {
+                            "sentence": "Build APIs using Python and FastAPI.",
+                            "section": "Responsibilities",
+                            "source": "page",
+                        }
+                    ],
+                }
+            ],
+            "requirements": {
+                "required_skills": [
+                    {
+                        "skills": ["Python", "python", "FastAPI"],
+                        "relation": "all",
+                        "evidence": {
+                            "sentence": "Required: Python and FastAPI.",
+                            "section": "Requirements",
+                            "source": "page",
+                        },
+                    }
+                ],
+                "experience_status": "known",
+            },
+        }
+    )
+    assert posting.role_tracks[0].track == "ai_backend"
+    assert posting.requirements is not None
+    assert posting.requirements.required_skills[0].skills == ["Python", "FastAPI"]
+
+
+def test_legacy_posting_has_no_structured_requirements() -> None:
+    posting = JobPosting(role="Software Engineer", skills_required=["Python"])
+    assert posting.role_tracks == [] and posting.requirements is None

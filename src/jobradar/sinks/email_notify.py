@@ -26,6 +26,7 @@ from jobradar.db.models import Job
 from jobradar.db.repo import Repo, TaskRecord
 from jobradar.pipeline.task_types import FRESH, SEND_ALERTS
 from jobradar.queue.tasks import PermanentError, RetryableError, TaskQueue
+from jobradar.sinks.candidate_context import resolve_sink_candidate
 from jobradar.sinks.email_actions import Actions, dashboard_url
 from jobradar.sinks.email_template import day_month, job_card, layout
 
@@ -52,12 +53,21 @@ def _closes(job: Job) -> str:
     return f" · closes {closes}" if closes else ""
 
 
-def subject(jobs: list[Job]) -> str:
+def subject(jobs: list[Job], scores_map: dict[str, int | None] | None = None) -> str:
+    scores = scores_map or {}
     if len(jobs) == 1:
         job = jobs[0]
-        return f"[JobRadar {job.score}] {_title(job)}{_closes(job)}"
-    best = max(jobs, key=lambda j: j.score or 0)
-    return f"[JobRadar] {len(jobs)} strong matches · best: {_title(best)} ({best.score})"
+        sc = scores.get(job.id, job.score)
+        sc_str = "\u2013" if sc is None else str(sc)
+        return f"[JobRadar {sc_str}] {_title(job)}{_closes(job)}"
+
+    def _sc(j: Job) -> int:
+        val = scores.get(j.id, j.score)
+        return val if val is not None else 0
+
+    best = max(jobs, key=_sc)
+    best_sc = _sc(best)
+    return f"[JobRadar] {len(jobs)} strong matches · best: {_title(best)} ({best_sc})"
 
 
 def where_posted(chat: str | None, platform: str = "telegram") -> str:
@@ -102,15 +112,30 @@ def build_email(
     actions: Actions | None = None,
     dashboard: str | None = None,
     notion: bool = True,
+    scores_map: dict[str, int | None] | None = None,
+    legacy_map: dict[str, bool] | None = None,
+    explanations: dict[str, str] | None = None,
 ) -> EmailMessage:
     """One alert email covering these jobs, as HTML and plain text. `seen` maps a job id to
     where and when it was posted; `actions` adds the "I applied" / "Not interested" buttons."""
     seen = seen or {}
+    scores = scores_map or {}
+    leg = legacy_map or {}
+    expl = explanations or {}
     cards = [
-        job_card(job, seen.get(job.id, ""), notion_url(job.notion_page_id, notion),
-                 actions=actions.job_links(job) if actions else None, dashboard=dashboard)
+        job_card(
+            job,
+            seen.get(job.id, ""),
+            notion_url(job.notion_page_id, notion),
+            actions=actions.job_links(job) if actions else None,
+            dashboard=dashboard,
+            score=scores.get(job.id),
+            score_override=job.id in scores,
+            is_legacy=leg.get(job.id, False),
+            explanation=expl.get(job.id),
+        )
         for job in jobs
-    ]  # fmt: skip
+    ]
     if len(jobs) == 1:
         title = "New strong match"
         subtitle = seen.get(jobs[0].id, "") or "Apply early: fresh posts get read first."
@@ -119,13 +144,18 @@ def build_email(
     else:
         title = f"{len(jobs)} new strong matches"
         subtitle = "Best first. Apply early: fresh posts get read first."
-    ordered = sorted(zip(jobs, cards, strict=True), key=lambda pair: -(pair[0].score or 0))
+
+    def _rank_score(pair: tuple[Job, tuple[str, str]]) -> int:
+        val = scores.get(pair[0].id, pair[0].score)
+        return val if val is not None else 0
+
+    ordered = sorted(zip(jobs, cards, strict=True), key=_rank_score, reverse=True)
     footer = (
         "Sent by JobRadar to you only. Each job alerts once; you get alerts for new jobs "
         "scoring at or above <code>scoring.alert_above</code>."
     )
     msg = EmailMessage()
-    msg["Subject"] = subject(jobs)
+    msg["Subject"] = subject(jobs, scores_map)
     msg["From"] = sender
     msg["To"] = to
     msg.set_content(
@@ -136,7 +166,7 @@ def build_email(
             "JobRadar alert",
             title,
             subtitle,
-            subject(jobs).removeprefix("[JobRadar] "),
+            subject(jobs, scores_map).removeprefix("[JobRadar] "),
             "".join(card for _, (card, _) in ordered),
             footer,
         ),
@@ -151,6 +181,7 @@ class AlertSender:
         settings: Settings,
         repo: Repo,
         queue: TaskQueue,
+        candidate_id: str | None = None,
         clock: Clock = utcnow,
         send: Send | None = None,
         preview_dir: Path = PREVIEW_DIR,
@@ -160,6 +191,7 @@ class AlertSender:
         self.secrets = settings.secrets
         self.repo = repo
         self.queue = queue
+        self.candidate_id = candidate_id
         self.clock = clock
         self._send = send or self._smtp
         self.preview_dir = preview_dir
@@ -193,6 +225,40 @@ class AlertSender:
         jobs = [job for job_id in batch if (job := self.repo.get_job(job_id)) is not None]
         if not jobs:
             return
+
+        cand, active_profile = resolve_sink_candidate(self.repo, self.settings, self.candidate_id)
+        if self.candidate_id and (cand is None or active_profile is None):
+            log.warning(
+                "candidate profile not confirmed or candidate not found; skipping alert",
+                extra={"candidate_id": self.candidate_id},
+            )
+            self.repo.finish_alerts([j.id for j in jobs], "skipped_unconfirmed")
+            return
+
+        scores_map: dict[str, int | None] = {}
+        legacy_map: dict[str, bool] = {}
+        explanations: dict[str, str] = {}
+        actions_cid: str | None = None
+
+        if cand and active_profile:
+            actions_cid = cand.id
+            for job in jobs:
+                assessments = self.repo.list_candidate_assessments(
+                    cand.id, job.id, active_profile.version
+                )
+                if assessments:
+                    best_ass = max(assessments, key=lambda a: a.technical_score or 0)
+                    scores_map[job.id] = best_ass.technical_score
+                    explanations[job.id] = best_ass.explanation
+                    legacy_map[job.id] = False
+                elif hist := self.repo.get_historical_assessment(cand.id, job.id):
+                    scores_map[job.id] = hist.score
+                    explanations[job.id] = hist.score_reason
+                    legacy_map[job.id] = True
+                else:
+                    scores_map[job.id] = job.score
+                    legacy_map[job.id] = True
+
         sender = self.secrets.email_address or "jobradar@localhost"
         to = self.secrets.notify_address or sender
         msg = build_email(
@@ -200,9 +266,12 @@ class AlertSender:
             sender,
             to,
             self._seen(jobs),
-            Actions.load(self.settings, self.repo),
+            Actions.load(self.settings, self.repo, candidate_id=actions_cid, clock=self.clock),
             dashboard_link(self.settings),
             self.settings.config.notion.enabled,
+            scores_map=scores_map if scores_map else None,
+            legacy_map=legacy_map if legacy_map else None,
+            explanations=explanations if explanations else None,
         )
         if self.notify.dry_run:
             path = save_preview(msg, self.preview_dir / f"{self.clock():%Y%m%d-%H%M%S}.html")

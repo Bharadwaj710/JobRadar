@@ -62,11 +62,11 @@ def outcome(status_now: str, next_round: bool) -> str:
     return REJECTED if status_now == JobStatus.REJECTED.value else WAITING
 
 
-def by_source(repo: Repo) -> BySource:
+def by_source(repo: Repo, candidate_id: str | None = None) -> BySource:
     grouped: dict[tuple[str, str], list[Application]] = {}
     outcomes: dict[str, str] = {}
     for platform, name, job_id, status, next_round, first in repo.applications_by_source(
-        UNDO_MINUTES
+        UNDO_MINUTES, candidate_id=candidate_id
     ):
         kind = outcome(status, next_round)
         outcomes[job_id] = kind

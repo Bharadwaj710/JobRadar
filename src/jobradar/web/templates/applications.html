@@ -56,8 +56,8 @@
 </section>
 {% endif %}
 
-{% set icons = {'shortlisted': 'i-star', 'applied': 'i-send', 'interview': 'i-chat', 'offer': 'i-trophy', 'rejected': 'i-x'} %}
-{% set hints = {'shortlisted': 'Shortlist a job from Today', 'applied': 'Tap “I applied” on a job', 'interview': 'Interview invites land here', 'offer': 'Here’s hoping', 'rejected': 'None so far'} %}
+{% set icons = {'shortlisted': 'i-star', 'saved': 'i-star', 'applied': 'i-send', 'interview': 'i-chat', 'interviewing': 'i-chat', 'offer': 'i-trophy', 'offered': 'i-trophy', 'rejected': 'i-x'} %}
+{% set hints = {'shortlisted': 'Shortlist a job from Today', 'saved': 'Shortlist a job from Today', 'applied': 'Tap “I applied” on a job', 'interview': 'Interview invites land here', 'interviewing': 'Interview invites land here', 'offer': 'Here’s hoping', 'offered': 'Here’s hoping', 'rejected': 'None so far'} %}
 <div class="board-wrap" data-board>
   {% set empty = columns|rejectattr('cards')|list %}
   {% if empty %}
@@ -87,8 +87,9 @@
           {{ avatar(c, 'sm') }}
           <div class="card-names">
             <a class="card-title" href="/jobs/{{ c.id }}" draggable="false">{{ c.company or c.role }}</a>
+            {% if c.closed_by_employer %}<span class="closed-badge" title="Posting closed by employer">Closed</span>{% endif %}
           </div>
-          {{ ring(c.score, 'sm') }}
+          {% if c.score is not none %}{{ ring(c.score, 'sm') }}{% elif c.historical_score is not none %}<span class="legacy-score" title="Legacy score: {{ c.historical_score }}">{{ c.historical_score }}<small>leg</small></span>{% else %}{{ ring(none, 'sm') }}{% endif %}
         </div>
         {% if c.company %}<p class="card-role">{{ c.role }}</p>{% endif %}
         {% if t.resume or t.replied or t.followed_up or c.status == 'resume_ready' %}

@@ -60,8 +60,24 @@ def level_ok(level: str | None) -> bool:
     return (level or "").casefold() not in _SENIOR_LEVELS
 
 
-def why_skipped(title: str, location: str, level: str | None = None) -> str | None:
-    """Why a posting isn't worth a look, in a few words; None when it is."""
+def why_skipped(
+    title: str,
+    location: str,
+    level: str | None = None,
+    *,
+    candidate_independent: bool = False,
+) -> str | None:
+    """Why a posting isn't worth a look, in a few words; None when it is.
+
+    When candidate_independent is True (multi-candidate platform mode), postings are not
+    globally rejected based on individual candidate preferences such as geography,
+    career track, or seniority. Those dimensions are evaluated per candidate by the
+    matching and eligibility engine. Only malformed or blank records are skipped at ingestion.
+    """
+    if not title or not title.strip():
+        return "empty title"
+    if candidate_independent:
+        return None
     if not where_ok(location):
         return "remote, but not open to India" if _REMOTE.search(location) else "not in India"
     if _NOT_TECH.search(title) or not _TECH.search(title):
@@ -71,5 +87,11 @@ def why_skipped(title: str, location: str, level: str | None = None) -> str | No
     return None
 
 
-def worth_a_look(title: str, location: str, level: str | None = None) -> bool:
-    return why_skipped(title, location, level) is None
+def worth_a_look(
+    title: str,
+    location: str,
+    level: str | None = None,
+    *,
+    candidate_independent: bool = False,
+) -> bool:
+    return why_skipped(title, location, level, candidate_independent=candidate_independent) is None

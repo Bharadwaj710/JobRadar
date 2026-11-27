@@ -95,6 +95,13 @@ def test_experience_and_text_from_the_description() -> None:
     stated = {**posting, "experienceRequirements": {"monthsOfExperience": 12}}
     assert from_job_posting(stated)["experience_min"] == 1  # the stated field wins
 
+    preferred = {
+        "@type": "JobPosting",
+        "title": "Developer",
+        "description": "<p>3+ years of professional experience preferred.</p>",
+    }
+    assert "experience_min" not in from_job_posting(preferred)
+
 
 def test_date_posted_becomes_published_on() -> None:
     base = {"@type": "JobPosting", "title": "Developer"}
