@@ -1,403 +1,516 @@
-# JobRadar: AI-Assisted, Multi-Candidate Career Intelligence Platform
+# JobRadar: AI-Assisted Multi-Candidate Career Intelligence Platform
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/Python-3.11%2B-brightgreen.svg)](pyproject.toml)
-[![Code style: ruff](https://img.shields.io/badge/Code%20Style-Ruff-black.svg)](pyproject.toml)
-[![Type Checked: mypy](https://img.shields.io/badge/Type%20Checked-Mypy%20Strict-blue.svg)](pyproject.toml)
+[![Code Style: Ruff](https://img.shields.io/badge/Code%20Style-Ruff-black.svg)](pyproject.toml)
+[![Type Checked: Mypy](https://img.shields.io/badge/Type%20Checked-Mypy%20Strict-blue.svg)](pyproject.toml)
 [![Tests: 994 passed](https://img.shields.io/badge/Tests-994%20Passed-success.svg)](submission/07_testing_and_validation_evidence.md)
 
-JobRadar is a local-first career intelligence platform designed to help technical job seekers discover hiring opportunities, evaluate technical alignment across specialized career tracks, independently verify eligibility constraints, and track applications through an accessible candidate dashboard.
+JobRadar is a local-first career intelligence platform that helps technical job seekers discover hiring opportunities, evaluate technical alignment across specialized career tracks, independently assess eligibility constraints, and manage applications through a candidate-facing dashboard.
 
-Originally created as an open-source personal job-search script by **Sameer** ([@ThePlator](https://github.com/ThePlator)), this repository represents an extensive architectural re-engineering into a multi-candidate, four-track technical matching platform with independent eligibility gating, resume ingestion, and real-time opportunity discovery.
+Originally created as an open-source personal job-search project by **Sameer ([@ThePlator](https://github.com/ThePlator))**, this repository represents an extensive architectural extension of that foundation into a multi-candidate platform with four-track technical matching, independent eligibility evaluation, resume onboarding, and candidate-specific application tracking.
+
+**This is my primary engineering contribution for the Spektra Systems AI-Native Software Engineer - Trainee evaluation.** The original project's contributions are acknowledged, and the extensions implemented in this repository are documented separately below.
 
 ---
 
-## Evaluation Context
+## Project at a Glance
 
-- **Candidate Repository:** [https://github.com/Bharadwaj710/JobRadar.git](https://github.com/Bharadwaj710/JobRadar.git)
-- **Active Branch:** `feat/j4-career-tracks` (Base HEAD: `fdd739b`)
-- **Primary Deliverables:** Multi-candidate tenant architecture, four-track J4 matching engine, opportunity discovery strip, Vercel-inspired responsive UI, and verified demo environment.
-- **Submission Dossier:** Comprehensive engineering reports and validation evidence are indexed in [submission/README.md](submission/README.md).
+| Area | Description |
+|---|---|
+| Project | JobRadar - Career Intelligence Platform |
+| My role | Project Developer |
+| Primary contribution | Multi-candidate architecture and J4 career intelligence engine |
+| Language | Python 3.11+ |
+| Backend | FastAPI, SQLModel, SQLite |
+| Matching | Four-track deterministic technical assessment |
+| Eligibility | Independent evidence-based eligibility evaluation |
+| Resume processing | PDF/DOCX extraction and structured profile review |
+| Interface | Responsive candidate dashboard |
+| Repository | [Bharadwaj710/JobRadar](https://github.com/Bharadwaj710/JobRadar) |
+| Original foundation | [ThePlator/JobRadar](https://github.com/ThePlator/JobRadar) |
+
+### What I Built and Extended
+
+Building on the original job ingestion and processing foundation, I developed substantial new capabilities:
+
+- **Multi-Candidate Architecture:** Reworked the original single-profile approach into candidate-specific profiles, assessments, and application data, with HMAC-SHA256 session signing and candidate ownership checks.
+- **Resume Onboarding and Review:** Implemented PDF/DOCX resume processing, structured profile extraction, and an interactive review workflow before profile confirmation.
+- **Four-Track J4 Matching Engine:** Implemented deterministic technical assessments across AI Backend, Full Stack, SDE / Systems, and SDET / QA.
+- **Independent Eligibility Evaluation:** Separated hard eligibility requirements from technical fit, with four states: `ELIGIBLE`, `LIKELY_ELIGIBLE`, `NEEDS_VERIFICATION`, and `NOT_ELIGIBLE`.
+- **Opportunity Discovery:** Preserved relevant postings with missing eligibility metadata instead of automatically discarding them.
+- **Candidate Application Tracking:** Added candidate-specific application stages, transition history, and audit records.
+- **Responsive Candidate Dashboard:** Developed the candidate-facing interface with track filtering, match explanations, dark/light themes, and responsive navigation.
+- **Isolated Demo Environment:** Implemented a deterministic demo seeder using synthetic candidate and job records, separated from the production database.
+
+---
+
+## Open-Source Origin and Contribution Transparency
+
+JobRadar is an extended derivative project, not an entirely original implementation.
+
+| Item | Details |
+|---|---|
+| Original project | [ThePlator/JobRadar](https://github.com/ThePlator/JobRadar) |
+| Original author | Sameer ([@ThePlator](https://github.com/ThePlator)) |
+| Original base commit | `fdd739b` |
+| Original license | MIT |
+| Original documentation | [Archived upstream README](docs/ORIGINAL_README.md) |
+| License file | [LICENSE](LICENSE) |
+
+### What the Original Foundation Provided
+
+The upstream project provided the initial single-user job discovery and processing foundation, including:
+
+- Python job ingestion pipeline and source adapters.
+- Telegram, email, and job-board source integrations.
+- URL normalization, link expansion, and posting deduplication.
+- Initial HTML/text extraction and fallback LLM infrastructure.
+- SQLite persistence and background task processing.
+- Original CLI tooling and resume-related functionality.
+
+### What I Re-Engineered and Extended
+
+My primary engineering work focused on transforming that foundation into a candidate-facing, multi-candidate career intelligence platform.
+
+The extensions include the candidate data model, resume onboarding and profile review, independent eligibility engine, four-track J4 matching, candidate-specific assessment persistence, application tracking, web interface, and isolated demo workflow.
+
+The original license and copyright notice are preserved. The archived upstream documentation is available at [docs/ORIGINAL_README.md](docs/ORIGINAL_README.md).
+
+---
+
+## Codebase Tour: Where to Explore the Implementation
+
+The following reading path helps technical reviewers inspect the most important engineering components without navigating the entire repository.
+
+| Order | Source file | What to inspect |
+|---|---|---|
+| 1 | [`src/jobradar/services/matching_service.py`](src/jobradar/services/matching_service.py) | Candidate-specific matching orchestration and assessment persistence |
+| 2 | [`src/jobradar/pipeline/technical_match.py`](src/jobradar/pipeline/technical_match.py) | Four-track deterministic technical scoring |
+| 3 | [`src/jobradar/pipeline/eligibility.py`](src/jobradar/pipeline/eligibility.py) | Independent eligibility evaluation and evidence handling |
+| 4 | [`src/jobradar/web/session.py`](src/jobradar/web/session.py) | HMAC-SHA256 session signing, validation, and CSRF-related protections |
+| 5 | [`src/jobradar/resume/parser.py`](src/jobradar/resume/parser.py) | Resume profile extraction and structured profile drafts |
+| 6 | [`src/jobradar/db/models.py`](src/jobradar/db/models.py) | Database entities and persistence models |
+| 7 | [`tests/test_phase3_final_e2e_validation.py`](tests/test_phase3_final_e2e_validation.py) | Complete candidate journey and isolation testing |
+
+### Repository Structure
+
+```text
+JobRadar/
+│
+├── README.md
+├── LICENSE
+├── pyproject.toml
+├── config.example.yaml
+├── profile.example.yaml
+│
+├── src/
+│   └── jobradar/
+│       ├── web/                 # Candidate-facing web application
+│       ├── services/            # Candidate matching orchestration
+│       ├── pipeline/            # Technical matching and eligibility
+│       ├── resume/              # Resume extraction and parsing
+│       └── db/                  # Database models and repositories
+│
+├── scripts/
+│   └── prepare_demo_data.py     # Isolated synthetic demo seeder
+│
+├── tests/                       # Unit, integration and browser tests
+│
+├── submission/                  # Evaluation documentation and evidence
+│   └── screenshots/             # Curated interface screenshots
+│
+└── docs/
+    └── ORIGINAL_README.md        # Archived upstream documentation
+```
 
 ---
 
 ## 1. Problem Statement
 
-Early-career software engineering candidates in India face several structural challenges during their job search:
-- **Scattered and Ephemeral Postings:** Postings appear unpredictably across company applicant tracking systems (Greenhouse, Lever, Ashby, Workday, SmartRecruiters), Telegram groups, and hiring drive announcements.
-- **Incomplete and Ambiguous Metadata:** Job postings routinely omit explicit graduation year requirements or describe experience ambiguously, causing naive filtering algorithms to falsely hide high-relevance positions.
-- **Conflated Scoring:** Monolithic job board algorithms combine skill competence and rigid eligibility gates into a single opaque percentage, confusing suitability with hard gating.
-- **Lack of Transparent Reasons:** Candidates rarely receive actionable feedback explaining which skills were matched, which are missing, and why an application may be filtered out.
-- **Data Privacy Risks:** Commercial job portals centralize candidate resumes and personal details in shared cloud databases, exposing applicants to spam and untracked third-party access.
+Early-career software engineering candidates face several challenges when navigating the job market:
 
-JobRadar addresses these problems by providing a local-first platform that decouples technical skill alignment from non-negotiable eligibility criteria, preserves high-potential unverified opportunities, and keeps all candidate data under personal control.
+- **Scattered Opportunities:** Job postings appear across company career pages, applicant tracking systems, Telegram channels, and hiring announcements.
+- **Incomplete Metadata:** Job postings frequently omit graduation-year, degree, or experience requirements.
+- **Conflated Matching and Eligibility:** A candidate can be technically suitable for a role but fail a mandatory eligibility condition.
+- **Limited Explainability:** Generic match percentages rarely explain which skills are supported by evidence and which requirements remain missing.
+- **Application Tracking:** Candidates need a consistent way to manage applications and track their progress.
 
----
-
-## 2. Open-Source Origin & Contribution Transparency
-
-This project builds upon an open-source foundation. In accordance with ethical engineering and open-source practices, the distinction between the original upstream project and my extensions is detailed below:
-
-- **Original Project:** [JobRadar](https://github.com/ThePlator/JobRadar)
-- **Original Author:** Sameer ([@ThePlator](https://github.com/ThePlator)), Electrical Engineering fresher in India
-- **Original Base Commit:** `fdd739b`
-- **Original License:** MIT License (preserved in [LICENSE](LICENSE))
-- **Original Upstream Documentation Archive:** Preserved in [docs/ORIGINAL_README.md](docs/ORIGINAL_README.md)
-
-### What the Original Foundation Provided:
-- Python job ingestion pipeline and source adapters (Telegram channel readers, career board crawlers, email forwarders).
-- URL normalization, link expansion, and posting deduplication.
-- Initial HTML/text extraction heuristics and fallback LLM extraction infrastructure.
-- SQLite persistence layer and background task queue architecture.
-- Single-user LaTeX resume tailoring template and basic CLI tooling.
-
-### What I Built and Extended:
-- **Multi-Candidate Architecture:** Replaced the hardcoded single-profile configuration with an isolated multi-candidate data model, HMAC-SHA256 session token management, and Insecure Direct Object Reference (IDOR) prevention.
-- **Resume Onboarding & Interactive Review:** Built automated PDF/DOCX resume text extraction, entity parsing, and an interactive web review interface allowing candidates to edit parsed skills, education, and track preferences before confirming immutable profile versions.
-- **Four-Track J4 Matching Engine:** Designed and implemented a deterministic technical scoring engine evaluating jobs independently across AI Backend, Full Stack, SDE / Systems, and SDET / QA tracks.
-- **Separate Eligibility Evaluation:** Architected an independent eligibility gating engine that separates technical competence from hard requirements (graduation year, degree branch, experience ceiling), producing four distinct semantic states (`ELIGIBLE`, `LIKELY_ELIGIBLE`, `NEEDS_VERIFICATION`, `NOT_ELIGIBLE`).
-- **Real-Time Opportunity Discovery:** Implemented an amber discovery strip on the candidate dashboard to surface postings with missing graduation metadata rather than falsely discarding them.
-- **Candidate Application Tracking:** Built an interactive Kanban application pipeline (`Saved` -> `Applied` -> `Interviewing` -> `Offered` -> `Rejected`) with complete candidate isolation and audit history logging.
-- **Vercel-Inspired UI System:** Redesigned the frontend using Geist typography, custom CSS properties, an accessible dark/light theme toggle, and responsive mobile navigation.
-- **Isolated Deterministic Demo Environment:** Created a safe, reproducible demo seeder (`scripts/prepare_demo_data.py`) operating against an isolated database with synthetic test personas and zero mutation of production data.
+JobRadar addresses these challenges by combining shared job discovery with candidate-specific technical assessments, independent eligibility evaluation, transparent explanations, and application tracking.
 
 ---
 
-## 3. Four-Track J4 Technical Matching Engine
+## 2. Four-Track J4 Technical Matching Engine
 
-JobRadar recognizes that modern software engineering candidates specialize in distinct functional disciplines. Rather than calculating a single generic match score, the engine evaluates each job posting independently across four technical tracks:
+JobRadar evaluates opportunities across four specialized technical career tracks.
 
-1. **AI Backend:** Focuses on Python, FastAPI, PyTorch, LangChain, LLM APIs, SQL, Docker, vector search concepts, and asynchronous microservices.
-2. **Full Stack:** Focuses on React, TypeScript, Node.js, Next.js, HTML5/CSS3, RESTful APIs, and modern frontend/backend integration.
-3. **SDE / Systems:** Focuses on C++, Go, Java, Linux internals, operating systems, distributed architectures, networking, and algorithms.
-4. **SDET / QA Automation:** Focuses on Pytest, Selenium, Playwright, CI/CD automation, load testing, mock services, and end-to-end test design.
+| Track | Focus Areas |
+|---|---|
+| **AI Backend** | Python, FastAPI, ML/AI integration, LLM APIs, SQL, Docker, and backend services |
+| **Full Stack** | React, TypeScript, Node.js, Next.js, REST APIs, and frontend/backend integration |
+| **SDE / Systems** | C++, Java, Go, operating systems, networking, algorithms, and distributed systems |
+| **SDET / QA** | Pytest, Selenium, Playwright, CI/CD, test automation, and end-to-end testing |
 
-A single job posting can be assessed across multiple tracks. For example, a backend platform vacancy might achieve an 88% match in AI Backend but only a 45% match in Full Stack.
+A job can be assessed independently across multiple tracks. The resulting assessments provide track-specific technical scores and explanations.
 
-### What the Technical Match Score Means
-The technical match score (0 to 100) reflects technical suitability based on verified candidate evidence and implemented weighted criteria. It is **not** a guarantee of an interview or a probability of being hired.
+### Technical Scoring Components
 
-The score is calculated deterministically using eight weighted components defined in [src/jobradar/pipeline/technical_match.py](src/jobradar/pipeline/technical_match.py):
+The J4 engine uses eight weighted components defined in [`src/jobradar/pipeline/technical_match.py`](src/jobradar/pipeline/technical_match.py).
 
-| Component Name | Weight | Evaluation Method |
-|---|---|---|
-| **Role Alignment** | 25% | Matches job titles and core functional descriptions against track taxonomies. |
-| **Required Skills** | 25% | Checks mandatory technical skills against approved candidate evidence. |
-| **Project & Internship Relevance** | 15% | Evaluates whether candidate projects demonstrated the technologies required by the role. |
-| **Education & Graduation Fit** | 10% | Assesses academic degree level and graduation timeline alignment. |
-| **Experience & Seniority Fit** | 10% | Compares candidate experience duration against requested seniority level. |
-| **Preferred Skills** | 5% | Grants bonus weighting for optional or nice-to-have competencies. |
-| **Location & Work Mode** | 5% | Checks alignment between posting location (remote/hybrid/onsite) and candidate preferences. |
-| **Compensation** | 5% | Evaluates salary alignment when salary data is published in the posting. |
+| Component | Weight |
+|---|---:|
+| Role alignment | 25% |
+| Required skills | 25% |
+| Preferred skills | 5% |
+| Project and internship relevance | 15% |
+| Education and graduation fit | 10% |
+| Experience and seniority fit | 10% |
+| Location and work mode | 5% |
+| Compensation | 5% |
+| **Total** | **100%** |
+
+The engine also uses a minimum evidence-coverage threshold of 0.70.
 
 ### Evidence-Based Matching
-The matching engine operates strictly on verified evidence extracted from candidate projects, experience descriptions, and confirmed skills. If a skill requirement is not evidenced in the candidate profile, it remains marked as missing or unknown. The engine never invents or hallucinates candidate qualifications.
+
+The matching engine evaluates approved candidate evidence from skills, projects, education, and experience.
+
+A skill that is not supported by the candidate's approved profile evidence is not automatically treated as demonstrated.
+
+Missing evidence remains unknown or missing rather than being converted into a fabricated qualification.
+
+**Important:** A technical match score is an assessment of technical alignment, not a probability of getting an interview or being hired.
 
 ---
 
-## 4. Independent Eligibility Evaluation
+## 3. Independent Eligibility Evaluation
 
-A central architectural principle of JobRadar is the strict separation between **technical skill alignment** and **hard eligibility constraints**.
+Technical suitability and employer eligibility are separate assessments.
 
-A candidate may possess a 95% technical skill match for a role but remain ineligible because the employer enforces a specific graduation batch or requires several years of industry experience. Conversely, a candidate who meets all eligibility criteria may lack the specific technical stack required for the position.
+A candidate might have strong technical alignment but fail a mandatory graduation-year requirement. Another candidate might satisfy all eligibility conditions but have limited technical alignment.
 
-### The Four Eligibility States:
+JobRadar keeps these decisions separate.
 
-- **`ELIGIBLE`:** All hard requirements (graduation year, degree branch, experience ceiling) are explicitly met based on verified posting criteria.
-- **`LIKELY_ELIGIBLE`:** Hard criteria are strongly implied by posting context with zero contradictory constraints found.
-- **`NEEDS_VERIFICATION`:** Essential eligibility criteria are omitted from the job posting (for example, the ATS posting does not specify a graduation year).
-- **`NOT_ELIGIBLE`:** The posting explicitly conflicts with candidate constraints (for example, requires 5+ years of experience or a 2021 graduation batch).
+### Eligibility States
 
-### Opportunity Discovery for Missing Information
-Real-world applicant tracking systems frequently publish early-career roles without mentioning graduation years. Under traditional filtering, such jobs are discarded as non-matches.
+| State | Meaning |
+|---|---|
+| `ELIGIBLE` | Explicit hard requirements are satisfied using available evidence. |
+| `LIKELY_ELIGIBLE` | Available posting context strongly supports eligibility without a contradictory constraint. |
+| `NEEDS_VERIFICATION` | Important eligibility information is missing or uncertain. |
+| `NOT_ELIGIBLE` | An explicit requirement conflicts with the candidate's confirmed profile. |
 
-JobRadar preserves these opportunities by classifying them as `NEEDS_VERIFICATION` and surfacing them on the candidate dashboard in an amber **Opportunity Discovery** strip. Candidates are presented with transparent explanations indicating exactly which criteria require manual verification before applying.
+### Opportunity Discovery
+
+Many real-world job postings omit graduation-year or other important eligibility information.
+
+Instead of treating missing information as an automatic rejection, JobRadar can classify such opportunities as `NEEDS_VERIFICATION`.
+
+These opportunities are surfaced in the candidate dashboard with explanations of the missing criteria, allowing candidates to verify them before applying.
+
+This preserves potentially relevant opportunities without pretending that unknown requirements have been satisfied.
 
 ---
 
-## 5. System Architecture & End-to-End Workflow
+## 4. System Architecture
+
+JobRadar separates shared job inventory from private candidate assessments and application records.
 
 ```mermaid
 flowchart TD
-    subgraph INGESTION["1. Shared Job Inventory (Read-Only)"]
-        S1["ATS Career Boards: Greenhouse, Lever, Ashby, Workday"] --> I1["Job Ingest & Deduplication"]
-        S2["Telegram Channels & Watched Pages"] --> I1
-        I1 --> I2["Robots.txt Compliant Page Fetcher"]
-        I2 --> I3["Requirement Extraction: Regex Rules First, LLM Fallback"]
-        I3 --> DB_JOBS[("Global SQLite Job Table")]
-    end
+    A["Job Sources and Career Boards"] --> B["Job Ingestion and Deduplication"]
+    B --> C["Requirement Extraction"]
+    C --> D[("Shared Job Inventory")]
 
-    subgraph ONBOARDING["2. Candidate Onboarding & Identity"]
-        U1["Candidate Uploads Resume: PDF / DOCX"] --> P1["Structural Parser & Entity Extractor"]
-        P1 --> P2["Interactive Review: Skills, Education, Track Choices"]
-        P2 --> P3["Confirmed Profile Version Snapshot"]
-        P3 --> AUTH["HMAC-SHA256 Session Cookie Issued"]
-    end
+    E["Resume Upload: PDF / DOCX"] --> F["Resume Parsing"]
+    F --> G["Interactive Profile Review"]
+    G --> H["Confirmed Candidate Profile"]
 
-    subgraph MATCHING["3. Candidate Matching Service (Isolated Scope)"]
-        DB_JOBS --> MS["CandidateMatchingService"]
-        P3 --> MS
-        MS --> TM["Deterministic J4 Technical Scoring: 4 Tracks (0-100)"]
-        MS --> EM["Independent Eligibility Gate: Batch, Degree, Ceiling"]
-        TM --> DB_ASSESS[("CandidateJobAssessment Table")]
-        EM --> DB_ASSESS
-    end
+    D --> I["CandidateMatchingService"]
+    H --> I
 
-    subgraph PRESENTATION["4. Candidate Web Experience"]
-        DB_ASSESS --> UI_DECIDE{"Eligibility Routing"}
-        UI_DECIDE -- "Confirmed Match" --> UI_CONFIRMED["Green Section: Confirmed Matches"]
-        UI_DECIDE -- "Missing Metadata" --> UI_DISCOVERY["Amber Strip: Opportunity Discovery"]
-        UI_DECIDE -- "Hard Failure" --> UI_INELIGIBLE["Filtered: Ineligible Roles with Reason"]
-        UI_CONFIRMED --> KANBAN["Kanban Application Pipeline & History Log"]
-        UI_DISCOVERY --> KANBAN
-    end
+    I --> J["Four-Track Technical Assessment"]
+    I --> K["Independent Eligibility Evaluation"]
+
+    J --> L[("Candidate-Specific Assessments")]
+    K --> L
+
+    L --> M["Candidate Dashboard"]
+    M --> N["Confirmed Matches"]
+    M --> O["Opportunity Discovery"]
+    M --> P["Eligibility Explanations"]
+
+    N --> Q["Application Tracking"]
+    O --> Q
 ```
 
-### End-to-End Workflow:
-1. **Global Ingestion:** Public job postings are ingested, deduplicated, and extracted into a shared, immutable inventory table.
-2. **Candidate Onboarding:** A candidate uploads a resume (PDF/DOCX), reviews extracted entities, customizes preferred career tracks, and confirms an immutable profile version.
-3. **Multi-Track Evaluation:** The `CandidateMatchingService` evaluates all active jobs against the candidate profile, computing four track scores and an independent eligibility verdict.
-4. **Dashboard Presentation:** The candidate dashboard categorizes opportunities into Confirmed Matches, Opportunity Discovery leads, and Ineligible roles with detailed evidence breakdowns.
-5. **Application Management:** The candidate tracks application progression on an isolated Kanban board with state transition logging.
+### End-to-End Workflow
+
+1. **Job Discovery:** Job postings are collected through the configured ingestion sources.
+2. **Shared Inventory:** Job records are normalized, deduplicated, and stored in the shared inventory.
+3. **Candidate Onboarding:** A candidate uploads a resume and reviews the extracted profile information.
+4. **Profile Confirmation:** The candidate confirms the profile before assessments are generated.
+5. **Matching:** `CandidateMatchingService` evaluates jobs against the candidate's approved profile.
+6. **Assessment Persistence:** Technical assessments and eligibility results are stored in candidate-specific records.
+7. **Dashboard:** Candidates see confirmed matches, opportunities requiring verification, and eligibility explanations.
+8. **Application Tracking:** Candidates manage their own application stages and history.
 
 ---
 
-## 6. Transparent AI Usage: Runtime AI vs. Deterministic Logic
+## 5. Transparent AI Usage
 
-JobRadar maintains a clear boundary between artificial intelligence and deterministic software engineering:
+JobRadar distinguishes between runtime AI features and deterministic application logic.
 
-```
-+---------------------------------------------------------------------------------------+
-|                                    JOBRADAR SYSTEM                                    |
-|                                                                                       |
-|  [ Runtime AI ]                                [ Deterministic Intelligence ]         |
-|  - LiteLLM integration (Gemini / Groq)         - Four-track J4 technical match (0-100)|
-|  - Fallback job description entity parser      - Eligibility rules (batch, degree)    |
-|  - Strict Pydantic structured output schemas   - Deterministic resume entity parser   |
-|  - Zero tool execution / zero agentic loops    - HMAC-SHA256 session token management |
-|  - Configurable daily INR budget cap           - SQLite full-text search (FTS5)       |
-|                                                - Candidate isolation & IDOR prevention|
-+---------------------------------------------------------------------------------------+
-                                           ^
-                                           | Built With
-+---------------------------------------------------------------------------------------+
-|  [ AI-Assisted Development (Engineering Time) ]                                       |
-|  - Claude Code and Antigravity used as developer software engineering agents          |
-|  - Automated test generation (994 unit tests, 6 Playwright E2E browser tests)         |
-|  - Architectural refactoring, Mypy strict type hardening, and documentation           |
-+---------------------------------------------------------------------------------------+
-```
+### Runtime AI
 
-### 1. Runtime AI (Application Features)
-- **Targeted LLM Job Description Fallback:** An LLM is called strictly when deterministic regex and heuristic rules fail to parse complex, unstructured job descriptions from scraped job postings (`src/jobradar/pipeline/extract.py`).
-- **Provider Support:** Uses LiteLLM to interface with Google Gemini (`gemini-flash-lite-latest`) or Groq.
-- **Structured Schema Enforcement:** Prompts treat raw text as data, disallow tools or external network calls, and validate outputs against strict Pydantic schemas.
-- **Budget Guardrails:** Adheres to a configurable daily budget cap (`llm.daily_budget_inr`) with call counters.
+The application uses LiteLLM for configured language-model providers in the job-description extraction fallback workflow.
 
-### 2. Deterministic Intelligence (Rules & Math)
-- **Resume Ingestion & Entity Parsing:** Resume text extraction from PDF/DOCX and entity parsing (contact details, education, technical skills, projects) are performed entirely by deterministic Python rules, regex, and taxonomy matching (`src/jobradar/resume/extract.py`, `src/jobradar/resume/parser.py`) without calling an LLM.
-- **Technical Match Scores:** The 0-100 track scores are computed entirely by deterministic Python code using weighted taxonomy intersections. No LLM generates or adjusts these scores (`src/jobradar/pipeline/technical_match.py`).
-- **Eligibility Gates:** Eligibility verdicts (`ELIGIBLE`, `NOT_ELIGIBLE`, etc.) are decided by deterministic boolean logic checking batch years, degree branches, and experience limits (`src/jobradar/pipeline/eligibility.py`).
-- **What is NOT Implemented:** JobRadar does not use vector embeddings, vector databases (such as Pinecone, Chroma, or Qdrant), retrieval-augmented generation (RAG), or autonomous application-submitting bots. Candidates manually submit every application.
+- Deterministic rules and heuristics are used first for job requirement extraction.
+- LLM fallback supports complex or unstructured job descriptions.
+- Structured outputs are validated using Pydantic schemas.
+- Provider configuration is maintained through the application configuration.
 
-### 3. AI-Assisted Engineering (Development Methodology)
-- Software engineering agents (Claude Code and Antigravity) were utilized as developer tools under human direction.
-- Agents assisted in codebase exploration, architectural refactoring, writing comprehensive Pytest and Playwright suites, enforcing strict static typing (`mypy strict`), and structuring documentation. All outputs were subject to human review and quality gates.
+### Deterministic Application Logic
 
----
+The following components are implemented as Python logic:
 
-## 7. Technology Stack
+- Four-track J4 technical scoring.
+- Eligibility state evaluation.
+- Candidate ownership and session validation.
+- Candidate-specific assessment orchestration.
+- Database persistence and application tracking.
 
-### Core Platform (Delivered Application):
-- **Language & Runtime:** Python 3.11.18+ (asynchronous architecture via `asyncio`)
-- **Web Framework:** FastAPI / Starlette / Uvicorn with Jinja2 server-side template rendering
-- **Database Layer:** SQLite 3.45+ with FTS5 full-text search, SQLModel / SQLAlchemy
-- **Document Processing:** `pypdf`, `python-docx`, `trafilatura`, `beautifulsoup4`
-- **LLM Abstraction:** LiteLLM (supporting Google Gemini and Groq with Pydantic validation)
-- **Frontend Architecture:** Modern vanilla JavaScript, semantic HTML5, CSS custom properties, Geist typography
-- **Quality & Testing:** Pytest 9.2+, Playwright Chromium, Ruff linter and formatter, Mypy strict type checker
-- **Environment Management:** `uv` package manager
+Resume processing supports deterministic, LLM-assisted, and hybrid extraction modes, with extraction metadata identifying the parser mode.
 
-### Inherited & Optional Integrations:
-- `telethon`: Optional Telegram channel listener (requires user Telegram API credentials).
-- `aiosmtplib` & `imap-tools`: Optional SMTP email alert dispatch and IMAP reply reader.
-- `notion-client`: Optional Notion mirror (disabled by default in candidate configuration).
+### What JobRadar Does Not Claim
+
+The current implementation does not depend on:
+
+- Vector databases such as Pinecone, Chroma, or Qdrant.
+- A vector-embedding-based RAG pipeline.
+- Autonomous application submission.
+
+Candidates remain responsible for reviewing opportunities and submitting applications.
+
+### AI-Assisted Development
+
+Claude Code and Antigravity were used as software engineering tools under my direction to assist with codebase exploration, implementation, refactoring, testing, debugging, and documentation.
+
+Implementation decisions, integration, and validation were subject to human review and engineering checks.
 
 ---
 
-## 8. Visual Demonstration & Interface Walkthrough
+## 6. Technology Stack
 
-Below are genuine interface captures from the local JobRadar application running against the synthetic demo dataset:
+| Category | Technologies |
+|---|---|
+| Language | Python 3.11+ |
+| Web framework | FastAPI, Starlette, Uvicorn |
+| Data models and persistence | SQLModel, SQLAlchemy, SQLite |
+| Validation | Pydantic |
+| Templates | Jinja2 |
+| Job extraction | LiteLLM, configured LLM providers |
+| Document processing | pypdf and supported DOCX processing |
+| Frontend | HTML5, CSS, JavaScript |
+| Testing | Pytest, Playwright |
+| Code quality | Ruff, Mypy |
+| Package management | uv |
 
-### 1. Resume Onboarding & Entity Extraction
-Candidates upload resumes in PDF or DOCX format. The parser extracts technical skills, education timelines, and work history.
+The web and browser-testing dependencies are configured as optional dependency groups in [`pyproject.toml`](pyproject.toml).
 
-![Resume Onboarding Flow](submission/screenshots/01_onboarding_flow.png)
+---
 
-### 2. Interactive Profile Review & Confirmation
-Candidates review, edit, and confirm parsed details before generating an immutable profile version snapshot.
+## 7. Visual Demonstration
 
-![Profile Review Screen](submission/screenshots/02_profile_review.png)
+The following screenshots demonstrate the candidate-facing application using synthetic demo records.
 
-### 3. Candidate Dashboard & Opportunity Discovery
-High-level overview displaying Confirmed Matches alongside the amber Opportunity Discovery strip (`NEEDS_VERIFICATION`) for roles with omitted batch years.
+### Resume Onboarding
+
+Candidates can upload resumes and begin the profile extraction workflow.
+
+![Resume Onboarding](submission/screenshots/01_onboarding_flow.png)
+
+### Interactive Profile Review
+
+Candidates can review and edit extracted profile information before confirmation.
+
+![Profile Review](submission/screenshots/02_profile_review.png)
+
+### Candidate Dashboard
+
+The dashboard displays confirmed matches and opportunities requiring eligibility verification.
 
 ![Candidate Dashboard](submission/screenshots/03_dashboard_light.png)
 
-### 4. Track-Specific Best Match Filtering (SDET Track)
-Filtering by a specific track dynamically re-ranks opportunities according to that track's unique technical requirements.
+### Track-Specific Filtering
+
+Candidates can explore opportunities using specialized career-track filters.
 
 ![SDET Track Filter](submission/screenshots/05_track_sdet_filter.png)
 
-### 5. Ineligible Roles Transparency Log
-When a role is classified as `NOT_ELIGIBLE`, the interface provides an explicit explanation of the hard constraint violation.
+### Eligibility Transparency
 
-![Ineligible Roles Transparency](submission/screenshots/06_ineligible_transparency.png)
+Ineligible opportunities include explanations of the conflicting eligibility requirements.
 
-### 6. Job Fit Detail & Skill Gap Breakdown
-Deep-dive view showing covered technical skills (green), alternative competencies (blue), and missing requirements.
+![Ineligible Roles](submission/screenshots/06_ineligible_transparency.png)
 
-![Job Fit Detail](submission/screenshots/07_job_detail_stripe.png)
+### Job Fit Breakdown
 
-### 7. Applications Kanban Board
-Candidate-isolated application pipeline tracking application stages with audit history.
+The job detail view provides technical fit explanations and skill-gap information.
+
+![Job Fit Details](submission/screenshots/07_job_detail_stripe.png)
+
+### Application Tracking
+
+Candidates can manage their application pipeline through the Kanban interface.
 
 ![Applications Board](submission/screenshots/08_applications_board.png)
 
-*All screenshots reflect synthetic demonstration records with zero personal identifying information.*
+All displayed screenshots use synthetic demonstration records.
+
+See the complete [Screenshot Index](submission/SCREENSHOT_INDEX.md).
 
 ---
 
-## 9. Local Setup & Execution Guide
+## 8. Local Setup and Demo Execution
 
 ### Prerequisites
-- Python 3.11 or higher
-- [uv](https://github.com/astral-sh/uv) package manager (recommended) or standard `pip`
-- Git
 
-### Step 1: Clone the Repository
+- Python 3.11 or later.
+- Git.
+- [uv package manager](https://github.com/astral-sh/uv).
+
+### Step 1: Clone the repository
+
 ```powershell
 git clone https://github.com/Bharadwaj710/JobRadar.git
 Set-Location JobRadar
 ```
 
-### Step 2: Initialize Virtual Environment & Install Dependencies
+### Step 2: Install dependencies
+
 ```powershell
-uv venv
-.venv\Scripts\activate
 uv sync --extra web
 ```
 
-### Optional: Install Browser Test Dependencies
-If running Playwright browser automation tests, install the optional `browser` dependencies and Chromium binaries separately:
+### Step 3: Prepare the isolated demo database
+
+The demo workflow creates synthetic candidate and job records in a separate database.
+
+```powershell
+uv run python scripts/prepare_demo_data.py --reset
+```
+
+### Step 4: Select the demo database
+
+```powershell
+$env:JOBRADAR_DB_PATH = "data/demo/jobradar_demo.db"
+```
+
+### Step 5: Launch the application
+
+```powershell
+uv run jobradar web
+```
+
+Open the dashboard:
+
+```text
+http://127.0.0.1:8080/candidate/dashboard
+```
+
+### Verify Demo Integrity
+
+```powershell
+uv run python scripts/prepare_demo_data.py --verify
+```
+
+**Important:** Keep the demo database path configured when using the demo environment. The default database path is separate from the isolated demo database.
+
+### Optional: Browser Testing Dependencies
+
+To run the Playwright browser tests:
+
 ```powershell
 uv sync --extra web --extra browser
 uv run playwright install chromium
 ```
 
-### Step 3: Configure Environment Variables
-Copy the example configuration:
-```powershell
-Copy-Item .env.example .env
-```
-*(Optional) If using LLM fallback extraction, configure your Gemini or Groq API key in `.env`:*
-```bash
-GEMINI_API_KEY=your_api_key_here
-```
+### Optional: Original Ingestion Workflow
 
-### Step 4: Run the Isolated Demo Environment (Recommended)
-JobRadar includes a deterministic, offline demo environment that provisions synthetic candidate **Alex Dev**, 6 multi-track demo jobs, and 24 J4 assessments:
+The original ingestion and background processing workflow can be launched separately:
 
 ```powershell
-# 1. Deterministically reset and seed the demo database
-uv run python scripts/prepare_demo_data.py --reset
-
-# 2. Point to the demo database
-$env:JOBRADAR_DB_PATH = "data/demo/jobradar_demo.db"
-
-# 3. Launch the web dashboard
-uv run jobradar web
-```
-
-Open your browser and navigate to:
-```
-http://127.0.0.1:8080/candidate/dashboard
-```
-
-Verify demo integrity at any time:
-```powershell
-uv run python scripts/prepare_demo_data.py --verify
-```
-
-### Optional: Ingestion Pipeline Workflow
-To run the background ATS board crawlers and task workers on a local database (separate from demo mode):
-```powershell
-# Run the pipeline worker and dashboard concurrently
 uv run jobradar run
 ```
-*Note: Full board crawling requires active internet connectivity. Telegram and email sources require additional credentials configured in `config/config.yaml`.*
 
-### Troubleshooting Common Issues
-- **Port 8080 Already in Use:** The server automatically scans and binds the next available port in the 8080-8089 range. To configure a specific port, update `web.port` in `config/config.yaml`.
-- **Database Path Confusion:** Ensure `$env:JOBRADAR_DB_PATH` is set when evaluating the demo database; otherwise, the app defaults to `data/jobradar.db`.
-- **Missing LaTeX Compiler:** If compiling raw LaTeX resumes on Windows, install MiKTeX or rely on the built-in HTML/text previews.
+Full source ingestion requires network access and any credentials required by the configured integrations.
 
 ---
 
-## 10. Automated Testing & Quality Gates
+## 9. Testing and Engineering Quality
 
-The codebase is protected by automated quality gates:
+The repository includes unit, integration, pipeline, and browser-level testing.
 
-| Quality Dimension | Tool / Command | Evidence & Results |
-|---|---|---|
-| **Full Pytest Suite** | `uv run pytest` | **994 passed**, 2 skipped (Windows LaTeX compiler missing), 0 failed across 140+ test modules in 128.5s. |
-| **Browser E2E Suite** | `uv run pytest tests/test_browser_candidate_flows.py` | **6 passed**, 0 failed covering onboarding, review, filtering, and tracking via Playwright Chromium. |
-| **Dedicated Phase 3 E2E** | `uv run pytest tests/test_phase3_final_e2e_validation.py` | **8 passed**, 0 failed covering candidate isolation and opportunity discovery. |
-| **Code Formatting** | `uv run ruff format --check` | **182 files fully formatted** (0.42s). |
-| **Linter Checks** | `uv run ruff check` | **0 errors, 0 warnings** across 182 files (0.38s). |
-| **Static Type Checking** | `uv run mypy src` | **Success: 0 issues in 102 source files** (strict mode, 22.18s). |
-| **Production DB Invariance** | SHA-256 verification | Production database (`data/jobradar.db`) remained 100% untouched throughout all testing (`5de19c...`). |
+The following results are documented in the formal validation evidence. They represent recorded validation runs, not tests newly executed while writing this README.
 
-*Note: Test counts reflect the documented verification execution recorded in [submission/07_testing_and_validation_evidence.md](submission/07_testing_and_validation_evidence.md). The dedicated Phase 3 suite (8 tests) and Playwright browser suite (6 tests) are specialized integration suites and are not double-counted with the main unit test suite.*
-
----
-
-## 11. Known Technical Limitations
-
-In the interest of engineering transparency, the following intentional boundaries are documented:
-
-1. **Local LaTeX Compiler Dependency:** Generating compiled PDF resumes requires a local LaTeX installation (`pdflatex` or `xelatex`). When absent, the application gracefully provides structured HTML and text previews.
-2. **Deferred TypeSafe Jev Integration:** The provider interface for TypeSafe Jev calibrated confidence scoring is implemented, but live integration is deferred until an API key is configured.
-3. **Profile Confirmation Prerequisite:** Automated Match Radar recommendations require a candidate profile in `confirmed` status. Draft profiles are not evaluated to prevent incomplete extractions from generating false recommendations.
-4. **Notion Mirroring Disabled:** Notion synchronization is disabled by default (`notion.enabled: false`) to favor the local FastAPI dashboard and avoid external SaaS rate limits.
-5. **Decoupled Legacy Schema Fields:** The database retains legacy single-user columns (`job.score`, `job.status`) for backward compatibility with upstream CLI tools, but all candidate workflows operate through decoupled candidate tables.
-
----
-
-## 12. Documentation Index & Provenance Links
-
-Complete architectural specifications and submission reports:
-
-| Document | Description |
+| Validation | Recorded result |
 |---|---|
-| [submission/README.md](submission/README.md) | Spektra Systems submission dossier index and executive summary. |
-| [submission/01_project_overview.md](submission/01_project_overview.md) | Detailed project provenance, problem statement, and scope comparison. |
-| [submission/02_system_architecture.md](submission/02_system_architecture.md) | Multi-candidate isolation, J4 career track architecture, and data schemas. |
-| [submission/03_end_to_end_pipeline.md](submission/03_end_to_end_pipeline.md) | Lifecycle from ATS discovery to ingestion, extraction, and tracking. |
-| [submission/04_ai_agent_engineering_methodology.md](submission/04_ai_agent_engineering_methodology.md) | Agentic software engineering workflows and quality gates. |
-| [submission/05_selected_agent_conversations.md](submission/05_selected_agent_conversations.md) | 7 authentic agent-developer problem solving case studies. |
-| [submission/06_code_review_and_quality_gates.md](submission/06_code_review_and_quality_gates.md) | Strict typing standards, code review checklist, and linter enforcement. |
-| [submission/07_testing_and_validation_evidence.md](submission/07_testing_and_validation_evidence.md) | Full execution logs for Pytest, Playwright, Ruff, and Mypy. |
-| [submission/08_known_limitations.md](submission/08_known_limitations.md) | Detailed technical boundaries and environment prerequisites. |
-| [submission/09_demo_walkthrough.md](submission/09_demo_walkthrough.md) | Step-by-step presenter notes and verification script. |
-| [submission/SCREENSHOT_INDEX.md](submission/SCREENSHOT_INDEX.md) | Catalog and descriptions of all 9 visual proof assets. |
-| [submission/SPEKTRA_FINAL_SUBMISSION_REPORT.md](submission/SPEKTRA_FINAL_SUBMISSION_REPORT.md) | Executive evaluation synthesis report. |
-| [DEMO_ENVIRONMENT_GUIDE.md](DEMO_ENVIRONMENT_GUIDE.md) | Standalone walkthrough guide for evaluating the isolated demo environment. |
-| [docs/ORIGINAL_README.md](docs/ORIGINAL_README.md) | Archive of the original upstream single-user JobRadar documentation. |
+| Full Pytest unit and integration suite | **994 passed, 2 skipped, 0 failed** |
+| Dedicated Phase 3 E2E suite | **8 passed, 0 failed** |
+| Playwright browser E2E suite | **6 passed, 0 failed** |
+| Ruff formatting | **182 files formatted** |
+| Ruff linting | **0 reported errors or warnings across 182 files** |
+| Mypy strict type checking | **0 issues across 102 source files** |
+
+The two skipped tests in the full suite relate to the unavailable LaTeX engine in the recorded Windows environment.
+
+The specialized Phase 3 and Playwright suites are separately reported and are not added to the main Pytest count.
+
+Full execution logs and supporting evidence are available in [submission/07_testing_and_validation_evidence.md](submission/07_testing_and_validation_evidence.md).
 
 ---
 
-## 13. License
+## 10. Known Limitations
 
-JobRadar is released under the [MIT License](LICENSE).
-Copyright (c) 2026 ThePlator (Sameer) and contributors.
+The following boundaries are documented in the current implementation:
+
+1. **LaTeX Compiler:** Compiled PDF resume generation requires a local LaTeX installation such as MiKTeX on Windows. HTML and text previews are available when the compiler is absent.
+2. **TypeSafe Jev Integration:** Live provider integration is deferred pending API access.
+3. **Profile Confirmation:** Automated Match Radar assessments require a confirmed candidate profile.
+4. **Notion Integration:** Notion mirroring is disabled by default in the candidate-facing configuration.
+5. **Legacy Database Fields:** Some original single-user schema fields remain for backward compatibility. Candidate workflows use candidate-specific records.
+
+For additional details, see [submission/08_known_limitations.md](submission/08_known_limitations.md).
+
+---
+
+## 11. Documentation and Further Exploration
+
+| Document | Purpose |
+|---|---|
+| [Submission Dossier](submission/README.md) | Index and overview of the engineering submission |
+| [Project Overview](submission/01_project_overview.md) | Problem statement, provenance, and contribution scope |
+| [System Architecture](submission/02_system_architecture.md) | Multi-candidate design and architecture |
+| [End-to-End Pipeline](submission/03_end_to_end_pipeline.md) | Job discovery, extraction, and processing workflow |
+| [AI Engineering Methodology](submission/04_ai_agent_engineering_methodology.md) | AI-assisted engineering approach |
+| [Selected Agent Conversations](submission/05_selected_agent_conversations.md) | Engineering problem-solving case studies |
+| [Code Review and Quality Gates](submission/06_code_review_and_quality_gates.md) | Code quality and static analysis |
+| [Testing and Validation Evidence](submission/07_testing_and_validation_evidence.md) | Recorded test results and execution logs |
+| [Known Limitations](submission/08_known_limitations.md) | Technical boundaries and deferred integrations |
+| [Demo Walkthrough](submission/09_demo_walkthrough.md) | Step-by-step demo instructions |
+| [Screenshot Index](submission/SCREENSHOT_INDEX.md) | Curated interface screenshots |
+| [Original Upstream README](docs/ORIGINAL_README.md) | Preserved original project documentation |
+
+---
+
+## 12. License and Attribution
+
+This repository retains the original upstream MIT license and copyright notice.
+
+See [LICENSE](LICENSE) for the full license terms.
+
+Original project: [Sameer (@ThePlator) - JobRadar](https://github.com/ThePlator/JobRadar).
+
+Extended project repository: [Bharadwaj710/JobRadar](https://github.com/Bharadwaj710/JobRadar).
+
