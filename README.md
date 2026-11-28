@@ -14,7 +14,6 @@ Originally created as an open-source personal job-search script by **Sameer** ([
 
 ## Evaluation Context
 
-- **Evaluation Target:** Spektra Systems: AI-Native Software Engineer - Trainee
 - **Candidate Repository:** [https://github.com/Bharadwaj710/JobRadar.git](https://github.com/Bharadwaj710/JobRadar.git)
 - **Active Branch:** `feat/j4-career-tracks` (Base HEAD: `fdd739b`)
 - **Primary Deliverables:** Multi-candidate tenant architecture, four-track J4 matching engine, opportunity discovery strip, Vercel-inspired responsive UI, and verified demo environment.
